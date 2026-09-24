@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, TypedDict
 
 
-class PRReviewState(TypedDict):
+class SState(TypedDict):
     repo_url: str
     repo_owner: str
     repo_name: str
@@ -19,3 +19,4 @@ class PRReviewState(TypedDict):
     dry_run: bool  # limites de autonomia: True = gera revisão, NÃO posta no GitHub
     review_history: List[Dict[str, Any]]
     final_message: str  # mensagem final da execução (sucesso OU falha) — distinta de error_message
+    consultar_llm_msg: str  # mensagem de saída do nó consultar_llm (para debug/diagnóstico) 

@@ -1,96 +1,60 @@
-import argparse
 import os
-
 from dotenv import load_dotenv
 
 load_dotenv()
-
 from src.graph import build_graph
 from src.tools.observability import get_observer
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Agente Revisor de PRs — analisa PRs abertos de um repositório GitHub"
-    )
-    parser.add_argument("repo_url", help="URL do repositório GitHub (ex.: https://github.com/dono/repositorio)")
-    parser.add_argument(
-        "--max-prs",
-        type=int,
-        default=int(os.getenv("MAX_PRS", "3")),
-        help="Limite máximo de PRs a revisar nesta execução (padrão: 3)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Limite de autonomia: gera as revisões e exibe no console, mas NÃO "
-            "posta nada no GitHub (postagem só ocorre com aprovação humana)"
-        ),
-    )
-    return parser.parse_args()
-
+# ALTERAÇÃO: A função `parse_args` e o uso de `argparse` foram completamente 
+# removidos, pois não recebemos mais `repo_url`, `max-prs` ou `dry-run` por 
+# linha de comando antes da execução[cite: 2].
 
 def main():
-    args = parse_args()
-
     graph = build_graph()
 
-    initial_state = {
-        "repo_url": args.repo_url,
-        "repo_owner": "",
-        "repo_name": "",
-        "is_valid": True,
-        "error_message": "",
-        "pending_prs": [],
-        "current_pr": {},
-        "current_diff": "",
-        "current_diff_sanitized": "",
-        "security_report": {},
-        "current_review": "",
-        "current_metadata_summary": "",
-        "processed_prs_count": 0,
-        "max_prs": max(1, args.max_prs),
-        "dry_run": bool(args.dry_run),
-        "review_history": [],
-        "final_message": "",
+    # ALTERAÇÃO: O `initial_state` foi simplificado drasticamente. Variáveis como 
+    # `pending_prs`, `current_diff`, e `security_report` foram removidas[cite: 2].
+    # NOVO: O estado agora foca apenas em gerenciar o histórico de mensagens da conversa.
+    state = {
+        "messages": []
     }
 
-    # Observabilidade (Issue #14): abre os dois sinais correlacionados por
-    # run_id — log estruturado JSONL + registro de auditoria com latências.
+    # Mantemos o início da observabilidade para rastrear as sessões do chat[cite: 2].
     observer = get_observer()
-    run_id = observer.start_run(
-        repo_url=args.repo_url, dry_run=bool(args.dry_run),
-        max_prs=max(1, args.max_prs),
-    )
-    print(f"[obs] run_id={run_id} — sinais sendo gravados em ./logs/")
-
-    status = "ok"
-    try:
-        result = graph.invoke(initial_state)
-    except Exception as e:  # crash inesperado: auditoria registra o evento
-        status = "crashed"
-        result = {
-            "final_message": f"Execução interrompida por erro inesperado: {e}",
-            "processed_prs_count": 0,
-            "repo_owner": "",
-            "repo_name": "",
-        }
-
-    paths = observer.finish_run(
-        status=status,
-        processed_prs=result.get("processed_prs_count", 0),
-        final_message=result.get("final_message", ""),
-        repo_owner=result.get("repo_owner", ""),
-        repo_name=result.get("repo_name", ""),
-    )
-
+    run_id = observer.start_run()
+    print(f"[obs] run_id={run_id} — chat iniciado")
     print("\n" + "=" * 50)
-    print(result.get("final_message", "Revisão concluída com sucesso!"))
+    print("Chatbot iniciado! (Digite 'sair' para encerrar)")
     print("=" * 50)
-    print(f"[obs] Log estruturado : {paths['structured_log']}")
-    print(f"[obs] Auditoria       : {paths['audit']}")
 
+    # ALTERAÇÃO: Adicionado um loop 'while True' no lugar da chamada única 
+    # de `graph.invoke(initial_state)` com try/except[cite: 2].
+    while True:
+        try:
+            # NOVO: Captura a entrada do usuário de forma interativa.
+            user_input = input("\nVocê: ")
+            if user_input.lower() in ['sair', 'exit', 'quit']:
+                break
+
+            # Adiciona a mensagem do usuário ao estado
+            state["messages"].append({"role": "user", "content": user_input})
+
+            # ALTERAÇÃO: Invocamos o grafo a cada nova interação, em vez de 
+            # apenas uma vez no início do script[cite: 2].
+            state = graph.invoke(state)
+
+            # Extrai e imprime a última mensagem (da LLM) após o processamento
+            ultima_mensagem = state["messages"][-1]["content"]
+            print(f"Assistente: {ultima_mensagem}")
+
+        except Exception as e:
+            # Mantemos a captura de crash inesperado, alertando no console[cite: 2].
+            print(f"Erro inesperado: {e}")
+            break
+
+    # Mantido o finalizador do observer para salvar logs ao sair do loop[cite: 2].
+    observer.finish_run(status="ok")
+    print("Chat encerrado.")
 
 if __name__ == "__main__":
     main()

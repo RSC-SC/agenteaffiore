@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from src.state import PRReviewState
+from src.state import SState
 from src.tools.observability import get_observer
 from src.tools.sanitizer import wrap_untrusted
 
@@ -161,7 +161,7 @@ def _get_providers():
     return providers
 
 
-def analisar_codigo(state: PRReviewState) -> Dict[str, Any]:
+def analisar_codigo(state: SState) -> Dict[str, Any]:
     # Usa o diff SANITIZADO (nunca o bruto) — defesa anti prompt-injection
     diff = state.get("current_diff_sanitized") or state.get("current_diff", "")
     history = state.get("review_history", [])
@@ -193,3 +193,13 @@ def analisar_codigo(state: PRReviewState) -> Dict[str, Any]:
     # estado) para que `current_review` seja sempre texto Markdown plano,
     # garantindo a postagem estruturada (ex.: como no PR #11).
     return {"current_review": _as_text(review)}
+
+    def consultar_llm(state: SState) -> Dict[str, Any]:
+        try:
+            print(f"Consultando LLM para o PR #{state.get('mensagem', {})}")
+        except RuntimeError as e:
+            # Falha estruturada: grafo termina de forma limpa com mensagem clara
+            return {
+                "pending_prs": [],
+                "error_message": f"Erro ao buscar PRs abertos: {e}",
+            }

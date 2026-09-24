@@ -1,7 +1,7 @@
 """Nó de governança: sanitiza o diff externo ANTES de qualquer contato com o LLM.
 
 Posicionamento no grafo:
-    coletar_diff_pr → sanitizar_diff ──fan-out──> analisar_codigo
+    coletar_diff_pr → sanitizar_diff ──fan-out──> 
                                               └> resumir_metadados
 
 Garante que nenhum texto não confiável chegue ao modelo sem passar pela
