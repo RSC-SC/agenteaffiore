@@ -1,18 +1,16 @@
+# src/graph.py
 import time
 from typing import Callable, Optional
-
 from langgraph.graph import END, StateGraph
-import src.nodes.code_analyzer
 
-#ALTERAÇÃO: Substituímos o PRReviewState por um ChatState (que você deverá criar
-# contendo apenas um array de "messages")[cite: 1].
-from src.state import ChatState 
+# REAPROVEITADO: Importando a função do nó diretamente de code_analyzer.py
+from src.nodes.code_analyzer import responder_chat
+from src.state import ChatState
 from src.tools.observability import get_observer
 
 
 def _instrumented(name: str, fn: Callable) -> Callable:
-    """Envolve um nó com os sinais de observabilidade."""
-    # Mantido o wrapper para registrar o tempo de execução (latência) e erros[cite: 1].
+    """Envolve o nó com os sinais de observabilidade existentes."""
     def wrapped(state: ChatState):
         obs = get_observer()
         obs.node_started(name)
@@ -25,27 +23,26 @@ def _instrumented(name: str, fn: Callable) -> Callable:
             )
             raise
         duration_ms = (time.perf_counter() - t0) * 1000
-        status = "ok"
-        obs.node_finished(name, duration_ms, status)
+        node_error = str(result.get("error_message", "") or "")
+        status = "error" if node_error else "ok"
+        if node_error:
+            obs.log_error(name, node_error)
+        obs.node_finished(
+            name, duration_ms, status, error=node_error
+        )
         return result
     return wrapped
 
 
 def build_graph() -> StateGraph:
-    # ALTERAÇÃO: Inicializamos o construtor usando o novo ChatState[cite: 1].
+    """Monta o grafo conversacional linear."""
     builder = StateGraph(ChatState)
 
-    # ALTERAÇÃO: Removemos todos os nós antigos de github e adicionamos apenas 
-    # o nó que fará a requisição para a LLM[cite: 1].
-    builder.add_node("consultar_llm", _instrumented("consultar_llm", src.nodes.code_analyzer.consultar_llm))
+    # Registra o nó utilizando a LLM do code_analyzer com observabilidade
+    builder.add_node("responder_chat", _instrumented("responder_chat", responder_chat))
 
-    # ALTERAÇÃO: O ponto de entrada agora é direto na consulta à LLM, substituindo 
-    # a antiga etapa de "validar_entrada"[cite: 1].
-    builder.set_entry_point("consultar_llm")
-    
-    
-    # ALTERAÇÃO: O fluxo vai direto da LLM para o final da execução em cada turno, 
-    # removendo as rotas paralelas (fan-out/fan-in) do código original[cite: 1].
-    builder.add_edge("consultar_llm", END)
+    # Fluxo direto: Início -> responder_chat -> END
+    builder.set_entry_point("responder_chat")
+    builder.add_edge("responder_chat", END)
 
     return builder.compile()
