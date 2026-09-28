@@ -4,11 +4,16 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 load_dotenv()
 
 from src.graph import build_graph
 from src.tools.observability import get_observer
+
+# Dicionário para guardar o estado de tempo (session_id -> datetime)
+historico_sessoes = {}
+TEMPO_EXPIRACAO_MINUTOS = 60
 
 app = FastAPI(
     title="API do Agente Conversacional",
@@ -20,7 +25,6 @@ app = FastAPI(
 graph = build_graph()
 
 # Memória de sessões em memória (session_id -> lista de mensagens)
-# Para produção distribuída, substitua por Redis ou PostgreSQL
 session_storage: Dict[str, List[Dict[str, str]]] = {}
 
 
@@ -60,27 +64,57 @@ def chat_endpoint(payload: ChatRequest):
     if not user_text:
         raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
 
-    # 1. Recupera ou cria o histórico da sessão
+    # 1. Controle de Tempo e Identificação de Primeira Mensagem
+    agora = datetime.now()
+    is_primeira_mensagem = False
+
+    if session_id not in historico_sessoes:
+        is_primeira_mensagem = True
+    else:
+        ultima_interacao = historico_sessoes[session_id]
+        # Se expirou o tempo limite, tratamos como conversa nova
+        if agora - ultima_interacao > timedelta(minutes=TEMPO_EXPIRACAO_MINUTOS):
+            is_primeira_mensagem = True
+            # CRUCIAL: Limpa a memória de mensagens antiga do LangGraph
+            if session_id in session_storage:
+                session_storage[session_id] = []
+
+    # Atualiza o relógio da última interação
+    historico_sessoes[session_id] = agora
+
+    # 2. Recupera ou cria o histórico de textos da sessão
     if session_id not in session_storage:
         session_storage[session_id] = []
 
     history = session_storage[session_id]
     
-    # 2. Adiciona a nova mensagem do usuário
+    # 3. Injeta contexto dinâmico para a IA se for o início da conversa
+    if is_primeira_mensagem:
+        print(f"🌟 NOVA CONVERSA INICIADA COM: {session_id}")
+        # Insere uma instrução de sistema antes da mensagem do usuário
+        history.append({
+            "role": "system", 
+            "content": "Aviso interno: Esta é a primeira mensagem do usuário nesta interação. Apresente-se ou inicie o fluxo adequadamente."
+        })
+    else:
+        print(f"🔄 CONTINUANDO CONVERSA COM: {session_id}")
+
+    # 4. Adiciona a nova mensagem do usuário
     history.append({"role": "user", "content": user_text})
 
-    # 3. Prepara o estado para o LangGraph
+    # 5. Prepara o estado para o LangGraph
     state_input = {
         "messages": history,
+        "is_first_message": is_primeira_mensagem, # Opcional: passa a flag para o State do grafo
         "error_message": ""
     }
 
-    # 4. Registra observabilidade (opcional, mantendo o padrão do projeto)
+    # 6. Registra observabilidade
     observer = get_observer()
     run_id = observer.start_run()
 
     try:
-        # Executa o grafo que invoca o responder_chat do code_analyzer.py
+        # Executa o grafo
         result_state = graph.invoke(state_input)
 
         if result_state.get("error_message"):
@@ -91,7 +125,7 @@ def chat_endpoint(payload: ChatRequest):
                 error=result_state["error_message"]
             )
 
-        # 5. Atualiza o histórico com a resposta da LLM
+        # 7. Atualiza o histórico com a resposta da LLM
         session_storage[session_id] = result_state.get("messages", history)
         ultima_resposta = session_storage[session_id][-1]["content"]
 
@@ -116,5 +150,6 @@ def reset_session(session_id: str):
     """Endpoint para limpar a memória de uma sessão específica."""
     if session_id in session_storage:
         del session_storage[session_id]
-        return {"message": f"Sessão {session_id} resetada com sucesso."}
-    return {"message": "Sessão não encontrada ou já vazia."}
+    if session_id in historico_sessoes:
+        del historico_sessoes[session_id]
+    return {"message": f"Sessão {session_id} resetada com sucesso."}

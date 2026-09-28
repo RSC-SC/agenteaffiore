@@ -8,6 +8,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
 
+
 def _try_gemini() -> Optional[BaseChatModel]:
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -30,7 +31,8 @@ def _try_openrouter() -> Optional[BaseChatModel]:
         return None
     try:
         from langchain_openai import ChatOpenAI
-        model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        model = os.getenv("OPENROUTER_MODEL",
+                          "nvidia/nemotron-3-super-120b-a12b:free")
         return ChatOpenAI(
             model=model,
             api_key=api_key,
@@ -45,10 +47,32 @@ def _try_openrouter() -> Optional[BaseChatModel]:
         return None
 
 
+def _try_groq() -> Optional[BaseChatModel]:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+            default_headers={
+                "HTTP-Referer": "https://github.com/RSC-SC/IADev-MiniProj-Mod2",
+                "X-Title": "Agente Revisor de PRs"
+            }
+        )
+    except Exception as e:
+        logger.warning(f"Falha ao carregar groq: {e}")
+        return None
+
+
 def _get_providers():
     providers = [
         ("Gemini", _try_gemini),
         ("OpenRouter", _try_openrouter),
+        ("GROQ", _try_groq)
     ]
     primary = (os.getenv("LLM_PRIMARY_PROVIDER") or "gemini").strip().lower()
     if primary == "openrouter":
@@ -58,7 +82,7 @@ def _get_providers():
             "LLM_PRIMARY_PROVIDER inválido: '%s'. Usando padrão (gemini).",
             primary,
         )
-    return providers        
+    return providers
 
 
 def responder_chat(state: dict) -> dict:
@@ -93,7 +117,8 @@ def responder_chat(state: dict) -> dict:
 
             logger.info("Tentando responder via provedor: %s", name)
             response = model_instance.invoke(formatted_messages)
-            ai_reply = response.content if hasattr(response, "content") else str(response)
+            ai_reply = response.content if hasattr(
+                response, "content") else str(response)
 
             return {
                 "messages": messages + [{"role": "assistant", "content": ai_reply}],
