@@ -1,93 +1,105 @@
+"""Módulo de inicialização e fábrica de modelos LLM com suporte a Tools."""
+import os
 import logging
-import re
-import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Optional, List, Any
+from dotenv import load_dotenv
 
+from langchain_core.tools import BaseTool
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-
-class LLMToolError(Exception):
-    """Falha estruturada da LLMTool.
-
-    Carrega contexto operacional para tratamento upstream nos nós:
-    - operation: qual operação falhou (ex.: 'get_open_prs')
-    - status_code: código HTTP quando disponível (None p/ erro local)
-    - original_error: mensagem original da exceção
-    """
-
-    def __init__(self, operation: str, original_error: str = "",
-                 status_code: Optional[int] = None):
-        self.operation = operation
-        self.status_code = status_code
-        self.original_error = original_error
-        http_part = f" [HTTP {status_code}]" if status_code else ""
-        super().__init__(f"LLMTool falhou em '{operation}'{http_part}: {original_error}")
+# Importação dos links e tools da loja
+try:
+    from src.tools.affiore_tool import AFFIORE_TOOLS
+except ImportError:
+    AFFIORE_TOOLS = []
 
 
-# Erros HTTP que valem retry (transitórios). Demais (401/403/404/422) são permanentes.
-_TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-_REPO_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
-
-
-class LLMTool:
-    """Wrapper resiliente da API LLM (PyGithub).
-
-    Garantias:
-    - Validação de entradas antes de qualquer chamada de rede
-    - Timeout em todas as requisições
-    - Retry limitado com backoff crescente apenas em falhas transitórias
-    - Falhas sempre estruturadas como LLMToolError (nunca exceções cruas)
-    """
-
-    def __init__(self, token: str, timeout: int = 30,
-                 max_retries: int = 3, retry_backoff_seconds: float = 2.0):
-        self._validate_token(token)
-        self.max_retries = max(1, max_retries)
-        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
-        try:
-            self.client = Github(auth=Auth.Token(token), timeout=timeout, per_page=50)
-        except Exception as e:
-            raise LLMToolError("inicializacao", str(e)) from e
-
-    # ------------------------------------------------------------------ #
-    # Validação de entradas
-    # ------------------------------------------------------------------ #
-
-    
-    # ------------------------------------------------------------------ #
-    # Execução com retry limitado e falhas estruturadas
-    # ------------------------------------------------------------------ #
-    def _execute_with_retry(self, operation: str, func: Callable) -> Any:
-        last_error: Optional[LLMToolError] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                return func()
-            except LLMToolError as e:
-                status = getattr(e, "status", None)
-                logger.warning(
-                    "LLMTool '%s' falhou na tentativa %d/%d (HTTP %s)",
-                    operation, attempt, self.max_retries, status,
-                )
-                last_error = e
-                if status not in _TRANSIENT_STATUS_CODES:
-                    break  # permanente: não insiste
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_backoff_seconds * attempt)
-            except Exception as e:  # erro de rede/local inesperado -> transitório
-                logger.warning(
-                    "LLMTool '%s' erro inesperado na tentativa %d/%d: %s",
-                    operation, attempt, self.max_retries, e,
-                )
-                wrapped = LLMToolError(status=None, data=str(e))
-                last_error = wrapped
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_backoff_seconds * attempt)
-
-        raise LLMToolError(
-            operation,
-            str(getattr(last_error, "data", last_error)),
-            getattr(last_error, "status", None),
+def _try_gemini():
+    """Inicializa o cliente do Google Gemini."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        model = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
+        return ChatGoogleGenerativeAI(
+            model=model,
+            google_api_key=api_key,
+            temperature=0.3,
         )
+    except Exception as e:
+        logger.warning(f"Falha ao carregar Google Gemini: {e}")
+        return None
+
+
+def _try_groq():
+    """Inicializa o cliente da Groq via ChatOpenAI compatível."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.warning(f"Falha ao carregar Groq: {e}")
+        return None
+
+
+def _try_openrouter():
+    """Inicializa o cliente do OpenRouter."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI
+        model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.warning(f"Falha ao carregar OpenRouter: {e}")
+        return None
+
+
+def get_llm(tools: Optional[List[BaseTool]] = None) -> Any:
+    """Retorna uma instância funcional de ChatModel com as ferramentas vinculadas."""
+    primary = os.getenv("LLM_PRIMARY_PROVIDER", "gemini").lower()
     
-    
+    # Ordem de fallback conforme o provedor preferencial
+    if primary == "groq":
+        providers = [_try_groq, _try_gemini, _try_openrouter]
+    elif primary == "openrouter":
+        providers = [_try_openrouter, _try_gemini, _try_groq]
+    else:  # padrão: gemini
+        providers = [_try_gemini, _try_groq, _try_openrouter]
+
+    llm_instance = None
+    selected_provider = None
+    for provider_func in providers:
+        client = provider_func()
+        if client is not None:
+            llm_instance = client
+            selected_provider = provider_func.__name__
+            break
+
+    if not llm_instance:
+        raise RuntimeError("Nenhum provedor de LLM configurado ou funcional.")
+
+    ferramentas = tools if tools is not None else AFFIORE_TOOLS
+    # Modelos :free do OpenRouter normalmente falham em tool_calling.
+    # Fazemos bind apenas se não for OpenRouter ou se for provedor com suporte garantido.
+    if ferramentas and selected_provider != "_try_openrouter":
+        return llm_instance.bind_tools(ferramentas)
+
+    return llm_instance
