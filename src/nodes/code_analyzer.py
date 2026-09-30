@@ -2,7 +2,7 @@
 import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import tool
@@ -14,6 +14,9 @@ CATALOGOS_LINKS = {
 }
 
 logger = logging.getLogger(__name__)
+
+# Controle em memória das sessões que já receberam a resposta padrão
+_SESSOES_RESPONDIDAS: Set[str] = set()
 
 
 @tool
@@ -137,24 +140,56 @@ def _get_providers():
 
 
 def responder_chat(state: dict) -> dict:
-    """Nó do agente que reage conversando com o usuário usando os provedores com fallback silencioso."""
+    """Nó do agente que reage conversando com o usuário usando os provedores com fallback ou modo estático."""
     messages = state.get("messages", [])
     if not messages:
         return {"error_message": "Nenhuma mensagem recebida no estado."}
 
-    # 1. Prompt de sistema orientando a persona da Affiore
+    session_id = state.get("session_id", "default_session")
+
+    # ==========================================
+    # VERIFICAÇÃO DA FLAG DISABLE_LLM
+    # ==========================================
+    disable_llm = os.getenv("DISABLE_LLM", "false").strip().lower() in ["true", "1", "yes"]
+
+    if disable_llm:
+        if session_id in _SESSOES_RESPONDIDAS:
+            logger.info("DISABLE_LLM ativo: sessão %s já foi respondida. Silenciando.", session_id)
+            return {
+                **state,
+                "response": "",
+                "error_message": ""
+            }
+
+        # Primeira vez nesta sessão: envia a mensagem padrão e marca no set
+        _SESSOES_RESPONDIDAS.add(session_id)
+        msg_estatica = os.getenv(
+            "STATIC_RESPONSE_MESSAGE",
+            "Olá! Nosso atendimento automático está temporariamente indisponível. Em breve um atendente irá falar com você!"
+        )
+        logger.info("DISABLE_LLM ativo: enviando mensagem padrão para sessão %s", session_id)
+        return {
+            **state,
+            "messages": messages + [{"role": "assistant", "content": msg_estatica}],
+            "response": msg_estatica,
+            "error_message": ""
+        }
+
+    # ==========================================
+    # FLUXO PADRÃO COM LLM
+    # ==========================================
     formatted_messages = [SystemMessage(content=SYSTEM_PROMPT_AFFIORE)]
 
-    # 2. Converte histórico do state para mensagens LangChain
+															  
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", "")
-        if role == "user":
+        if role in ["user", "human"]:
             formatted_messages.append(HumanMessage(content=content))
-        elif role == "assistant":
+        elif role in ["assistant", "ai"]:
             formatted_messages.append(AIMessage(content=content))
 
-    # 3. Itera sobre a lista de provedores tentando inicializar e chamar .invoke() silenciosamente
+																								  
     last_error = ""
     for name, provider_factory in _get_providers():
         try:
@@ -164,7 +199,7 @@ def responder_chat(state: dict) -> dict:
 
             logger.debug("Tentando responder via provedor: %s", name)
 
-            # OpenRouter gratuito não aceita tools (erro 404). Vincula apenas a provedores compatíveis.
+																										 
             if name in ["Gemini", "GROQ"]:
                 active_llm = model_instance.bind_tools([obter_links_catalogo])
             else:
@@ -172,7 +207,7 @@ def responder_chat(state: dict) -> dict:
 
             response = active_llm.invoke(formatted_messages)
 
-            # 4. Trata execução de tools se a LLM tiver solicitado
+																	
             if hasattr(response, "tool_calls") and response.tool_calls:
                 mensagens_com_tools = list(formatted_messages) + [response]
 
@@ -201,7 +236,7 @@ def responder_chat(state: dict) -> dict:
             else:
                 ai_reply = response.content if hasattr(response, "content") else str(response)
 
-            # Retorno limpo se algum modelo responder com sucesso
+																 
             return {
                 **state,
                 "messages": messages + [{"role": "assistant", "content": ai_reply}],
@@ -209,11 +244,11 @@ def responder_chat(state: dict) -> dict:
                 "error_message": ""
             }
         except Exception as e:
-            # Registra como debug sem poluir a saída do usuário
+																 
             logger.debug("Falha interna ao tentar provedor %s: %s", name, e)
             last_error = f"{name}: {e}"
 
-    # Se TODOS os provedores falharem, registra o aviso nos logs
+																
     logger.error("Todos os provedores falharam. Último erro: %s", last_error)
 
     return {

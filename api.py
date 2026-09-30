@@ -1,4 +1,7 @@
 # api.py
+from fastapi.middleware.cors import CORSMiddleware
+from src.tools.observability import get_observer
+from src.graph import build_graph
 import os
 from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
@@ -8,8 +11,8 @@ from datetime import datetime, timedelta
 
 load_dotenv()
 
-from src.graph import build_graph
-from src.tools.observability import get_observer
+
+# No topo do api.py, junto aos imports do FastAPI
 
 # Dicionário para guardar o estado de tempo (session_id -> datetime)
 historico_sessoes = {}
@@ -19,6 +22,15 @@ app = FastAPI(
     title="API do Agente Conversacional",
     description="Endpoint para integração com n8n e outros sistemas externos.",
     version="1.0.0"
+)
+
+# Logo após instanciar: app = FastAPI(...)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite requisições de qualquer navegador/origem durante os testes
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Compila o grafo do LangGraph uma única vez na inicialização
@@ -31,7 +43,8 @@ session_storage: Dict[str, List[Dict[str, str]]] = {}
 # --- Modelos de Entrada e Saída (Pydantic) ---
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., description="Mensagem de texto enviada pelo usuário")
+    message: str = Field(...,
+                         description="Mensagem de texto enviada pelo usuário")
     session_id: str = Field(
         default="default_session",
         description="Identificador único da conversa para manter a memória"
@@ -40,6 +53,7 @@ class ChatRequest(BaseModel):
         default=None,
         description="Metadados adicionais opcionais repassados pelo n8n"
     )
+
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -62,7 +76,8 @@ def chat_endpoint(payload: ChatRequest):
     user_text = payload.message.strip()
 
     if not user_text:
-        raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
+        raise HTTPException(
+            status_code=400, detail="A mensagem não pode estar vazia.")
 
     # 1. Controle de Tempo e Identificação de Primeira Mensagem
     agora = datetime.now()
@@ -75,7 +90,7 @@ def chat_endpoint(payload: ChatRequest):
         # Se expirou o tempo limite, tratamos como conversa nova
         if agora - ultima_interacao > timedelta(minutes=TEMPO_EXPIRACAO_MINUTOS):
             is_primeira_mensagem = True
-            # CRUCIAL: Limpa a memória de mensagens antiga do LangGraph
+            # Limpa a memória de mensagens antiga do LangGraph
             if session_id in session_storage:
                 session_storage[session_id] = []
 
@@ -87,13 +102,12 @@ def chat_endpoint(payload: ChatRequest):
         session_storage[session_id] = []
 
     history = session_storage[session_id]
-    
+
     # 3. Injeta contexto dinâmico para a IA se for o início da conversa
     if is_primeira_mensagem:
         print(f"🌟 NOVA CONVERSA INICIADA COM: {session_id}")
-        # Insere uma instrução de sistema antes da mensagem do usuário
         history.append({
-            "role": "system", 
+            "role": "system",
             "content": "Aviso interno: Esta é a primeira mensagem do usuário nesta interação. Apresente-se ou inicie o fluxo adequadamente."
         })
     else:
@@ -102,10 +116,12 @@ def chat_endpoint(payload: ChatRequest):
     # 4. Adiciona a nova mensagem do usuário
     history.append({"role": "user", "content": user_text})
 
-    # 5. Prepara o estado para o LangGraph
+    # 5. Prepara o estado para o LangGraph (incluindo session_id para a flag DISABLE_LLM)
     state_input = {
+        "session_id": session_id,
         "messages": history,
-        "is_first_message": is_primeira_mensagem, # Opcional: passa a flag para o State do grafo
+        "is_first_message": is_primeira_mensagem,
+        "response": "",
         "error_message": ""
     }
 
@@ -125,15 +141,20 @@ def chat_endpoint(payload: ChatRequest):
                 error=result_state["error_message"]
             )
 
-        # 7. Atualiza o histórico com a resposta da LLM
+        # 7. Atualiza o histórico em memória e extrai a resposta
         session_storage[session_id] = result_state.get("messages", history)
-        ultima_resposta = session_storage[session_id][-1]["content"]
+
+        # Pega a resposta gerada (seja da LLM, mensagem estática ou "" quando silenciado)
+        resposta_gerada = result_state.get("response", "")
+        if not resposta_gerada and session_storage[session_id] and session_storage[session_id][-1].get("role") == "assistant":
+            resposta_gerada = session_storage[session_id][-1].get(
+                "content", "")
 
         observer.finish_run(status="ok")
 
         return ChatResponse(
             session_id=session_id,
-            response=ultima_resposta,
+            response=resposta_gerada,
             error=None
         )
 

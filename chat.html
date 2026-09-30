@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Affiore - Teste do Agente</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: #f0f2f5; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; padding: 12px; }
+    
+    .chat-container { width: 100%; max-width: 520px; height: 92vh; background: #ffffff; border-radius: 12px; display: flex; flex-direction: column; box-shadow: 0 4px 20px rgba(0,0,0,0.1); overflow: hidden; }
+    
+    /* Configurações da API */
+    .config-bar { background: #f8f9fa; padding: 8px 12px; border-bottom: 1px solid #e9ecef; font-size: 11px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .config-bar input { flex: 1; min-width: 140px; padding: 4px 8px; border: 1px solid #ced4da; border-radius: 4px; font-size: 11px; }
+    .config-bar button { padding: 4px 8px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    
+    /* Cabeçalho */
+    .header { background: #4a3427; color: #fff; padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; }
+    .header h2 { font-size: 16px; font-weight: 600; }
+    .status-dot { width: 8px; height: 8px; background: #25d366; border-radius: 50%; display: inline-block; margin-right: 6px; }
+
+    /* Área de mensagens */
+    .messages-area { flex: 1; padding: 16px; overflow-y: auto; background: #e5ddd5; display: flex; flex-direction: column; gap: 8px; }
+    .msg { max-width: 80%; padding: 8px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.45; word-wrap: break-word; white-space: pre-wrap; }
+    .msg-user { align-self: flex-end; background: #dcf8c6; border-bottom-right-radius: 2px; }
+    .msg-bot { align-self: flex-start; background: #ffffff; border-bottom-left-radius: 2px; box-shadow: 0 1px 1px rgba(0,0,0,0.06); }
+    .msg-system { align-self: center; background: #fff3cd; color: #856404; font-size: 11px; border-radius: 12px; padding: 4px 10px; }
+    
+    /* Área de entrada */
+    .input-area { display: flex; padding: 10px; background: #f0f0f0; gap: 8px; border-top: 1px solid #ddd; }
+    .input-area textarea { flex: 1; padding: 10px; border-radius: 20px; border: 1px solid #ccc; outline: none; resize: none; height: 42px; font-size: 13px; }
+    .input-area button { background: #4a3427; color: white; border: none; padding: 0 16px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; width: 42px; height: 42px; }
+    .input-area button:disabled { background: #aaa; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+<div class="chat-container">
+  <!-- Painel de Configuração de Rede -->
+  <div class="config-bar">
+    <input type="text" id="apiUrl" value="http://150.136.45.59:8080/chat" title="URL do endpoint /chat">
+    <input type="text" id="sessionId" value="teste_browser_01" title="Session ID">
+    <button onclick="resetSession()" title="Limpa memória">Reset</button>
+  </div>
+
+  <!-- Cabeçalho -->
+  <div class="header">
+    <div>
+      <h2>Affiore • Arte em Presentear</h2>
+      <div style="font-size: 11px; opacity: 0.8;"><span class="status-dot"></span>Online</div>
+    </div>
+  </div>
+
+  <!-- Mensagens -->
+  <div class="messages-area" id="messagesArea">
+    <div class="msg msg-system">Conectado ao canal de testes do agente</div>
+  </div>
+
+  <!-- Entrada de Texto -->
+  <div class="input-area">
+    <textarea id="userInput" placeholder="Digite uma mensagem..." onkeydown="handleKey(event)"></textarea>
+    <button id="sendBtn" onclick="sendMessage()">➤</button>
+  </div>
+</div>
+
+<script>
+  const messagesArea = document.getElementById('messagesArea');
+  const userInput = document.getElementById('userInput');
+  const sendBtn = document.getElementById('sendBtn');
+  const apiUrlInput = document.getElementById('apiUrl');
+  const sessionIdInput = document.getElementById('sessionId');
+
+  function appendMessage(text, role) {
+    const div = document.createElement('div');
+    div.className = `msg ${role === 'user' ? 'msg-user' : (role === 'system' ? 'msg-system' : 'msg-bot')}`;
+    div.innerText = text;
+    messagesArea.appendChild(div);
+    messagesArea.scrollTop = messagesArea.scrollHeight;
+  }
+
+  function handleKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+
+  async function sendMessage() {
+    const text = userInput.value.trim();
+    const apiUrl = apiUrlInput.value.trim();
+    const sessionId = sessionIdInput.value.trim();
+
+    if (!text) return;
+
+    appendMessage(text, 'user');
+    userInput.value = '';
+    userInput.focus();
+
+    userInput.disabled = true;
+    sendBtn.disabled = true;
+
+    try {
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: text,
+          session_id: sessionId
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error(`Status ${res.status}: ${res.statusText}`);
+      }
+
+      const data = await res.json();
+      
+      if (data.response) {
+        appendMessage(data.response, 'bot');
+      } else if (data.response === "") {
+        appendMessage("[Sem resposta do agente: modo silencioso ou limite atingido]", 'system');
+      } else if (data.error) {
+        appendMessage(`Erro retornado: ${data.error}`, 'system');
+      }
+    } catch (err) {
+      appendMessage(`Falha de conexão: ${err.message}`, 'system');
+    } finally {
+      userInput.disabled = false;
+      sendBtn.disabled = false;
+      userInput.focus();
+    }
+  }
+
+  function resetSession() {
+    sessionIdInput.value = "sessao_" + Math.floor(Math.random() * 10000);
+    appendMessage(`Nova sessão gerada: ${sessionIdInput.value}`, 'system');
+  }
+</script>
+
+</body>
+</html>
