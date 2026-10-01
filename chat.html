@@ -39,9 +39,10 @@
 <div class="chat-container">
   <!-- Painel de Configuração de Rede -->
   <div class="config-bar">
-    <input type="text" id="apiUrl" value="https://150.136.45.59/chat" title="URL do endpoint /chat">
+    <input type="text" id="apiUrl" value="http://localhost:8000/chat" title="URL do endpoint /chat">
     <input type="text" id="sessionId" value="teste_browser_01" title="Session ID">
-    <button onclick="resetSession()" title="Limpa memória">Reset</button>
+    <input type="password" id="authToken" placeholder="API token" title="API_AUTH_TOKEN (Bearer)">
+    <button onclick="resetSession()" title="Limpa a memória da sessão no servidor e gera uma nova">Reset</button>
   </div>
 
   <!-- Cabeçalho -->
@@ -59,7 +60,7 @@
 
   <!-- Entrada de Texto -->
   <div class="input-area">
-    <textarea id="userInput" placeholder="Digite uma mensagem..." onkeydown="handleKey(event)"></textarea>
+    <textarea id="userInput" placeholder="Digite uma mensagem..." maxlength="4000" onkeydown="handleKey(event)"></textarea>
     <button id="sendBtn" onclick="sendMessage()">➤</button>
   </div>
 </div>
@@ -70,13 +71,49 @@
   const sendBtn = document.getElementById('sendBtn');
   const apiUrlInput = document.getElementById('apiUrl');
   const sessionIdInput = document.getElementById('sessionId');
+  const authTokenInput = document.getElementById('authToken');
+
+  // Espelha MAX_MENSAGEM_CARACTERES da API. Ao mudar lá, mude aqui.
+  const LIMITE_MENSAGEM = 4000;
+  // Aborta a requisição se o provedor demorar demais.
+  const TIMEOUT_MS = 60000;
+
+  function cabecalhos() {
+    const h = { 'Content-Type': 'application/json' };
+    const token = authTokenInput.value.trim();
+    if (token) h['Authorization'] = 'Bearer ' + token;
+    return h;
+  }
+
+  function baseUrl() {
+    // "/chat" vira a raiz, para o DELETE de reset.
+    return apiUrlInput.value.trim().replace(/\/+$/, '').replace(/\/chat$/, '');
+  }
 
   function appendMessage(text, role) {
     const div = document.createElement('div');
     div.className = `msg ${role === 'user' ? 'msg-user' : (role === 'system' ? 'msg-system' : 'msg-bot')}`;
+    // innerText, nunca innerHTML: a resposta do LLM nunca vira markup.
     div.innerText = text;
     messagesArea.appendChild(div);
     messagesArea.scrollTop = messagesArea.scrollHeight;
+    return div;
+  }
+
+  function showThinking() {
+    const div = appendMessage('Digitando…', 'bot');
+    div.dataset.thinking = '1';
+    div.style.opacity = '0.6';
+  }
+
+  function clearThinking() {
+    messagesArea.querySelectorAll('[data-thinking]').forEach(el => el.remove());
+  }
+
+  function setBusy(busy) {
+    userInput.disabled = busy;
+    sendBtn.disabled = busy;
+    if (!busy) userInput.focus();
   }
 
   function handleKey(e) {
@@ -88,53 +125,95 @@
 
   async function sendMessage() {
     const text = userInput.value.trim();
-    const apiUrl = apiUrlInput.value.trim();
-    const sessionId = sessionIdInput.value.trim();
 
     if (!text) return;
+    if (text.length > LIMITE_MENSAGEM) {
+      appendMessage(`Mensagem muito longa (máximo de ${LIMITE_MENSAGEM} caracteres).`, 'system');
+      return;
+    }
 
     appendMessage(text, 'user');
     userInput.value = '';
-    userInput.focus();
 
-    userInput.disabled = true;
-    sendBtn.disabled = true;
+    const apiUrl = apiUrlInput.value.trim();
+    const sessionId = sessionIdInput.value.trim() || 'default_session';
+    showThinking();
+    setBusy(true);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     try {
       const res = await fetch(apiUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: text,
-          session_id: sessionId
-        })
+        headers: cabecalhos(),
+        signal: controller.signal,
+        body: JSON.stringify({ message: text, session_id: sessionId })
       });
 
+      clearThinking();
+
+      if (res.status === 401) {
+        appendMessage('Não autorizado: preencha o API token na barra acima.', 'system');
+        return;
+      }
+      if (res.status === 429) {
+        appendMessage('Limite de requisições atingido. Aguarde alguns instantes.', 'system');
+        return;
+      }
       if (!res.ok) {
-        throw new Error(`Status ${res.status}: ${res.statusText}`);
+        appendMessage(`Servidor respondeu ${res.status}.`, 'system');
+        return;
       }
 
       const data = await res.json();
-      
-      if (data.response) {
+
+      // A ordem importa: em erro a API devolve response == "" , então testar
+      // data.response antes de data.error esconderia o erro.
+      if (data.error) {
+        appendMessage(`Agente indisponível: ${data.error}`, 'system');
+      } else if (data.response) {
         appendMessage(data.response, 'bot');
-      } else if (data.response === "") {
-        appendMessage("[Sem resposta do agente: modo silencioso ou limite atingido]", 'system');
-      } else if (data.error) {
-        appendMessage(`Erro retornado: ${data.error}`, 'system');
+      } else {
+        appendMessage('(sem resposta do agente)', 'system');
       }
     } catch (err) {
-      appendMessage(`Falha de conexão: ${err.message}`, 'system');
+      clearThinking();
+      const motivo = err.name === 'AbortError'
+        ? `tempo limite de ${TIMEOUT_MS / 1000}s excedido`
+        : err.message;
+      appendMessage(`Falha de conexão: ${motivo}`, 'system');
     } finally {
-      userInput.disabled = false;
-      sendBtn.disabled = false;
-      userInput.focus();
+      clearTimeout(timer);
+      clearThinking();
+      setBusy(false);
     }
   }
 
-  function resetSession() {
-    sessionIdInput.value = "sessao_" + Math.floor(Math.random() * 10000);
-    appendMessage(`Nova sessão gerada: ${sessionIdInput.value}`, 'system');
+  async function resetSession() {
+    const antiga = sessionIdInput.value.trim();
+    const nova = 'sessao_' + Math.floor(Math.random() * 100000);
+
+    // Limpa a memória no servidor antes de trocar de id — sem isso, a conversa
+    // antiga continuaria ocupando espaço até o TTL expirar.
+    if (antiga) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10000);
+        await fetch(`${baseUrl()}/chat/${encodeURIComponent(antiga)}`, {
+          method: 'DELETE',
+          headers: cabecalhos(),
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+      } catch (err) {
+        appendMessage('Não foi possível limpar a sessão anterior no servidor.', 'system');
+      }
+    }
+
+    sessionIdInput.value = nova;
+    appendMessage(`Nova sessão: ${nova}`, 'system');
+    userInput.focus();
   }
 </script>
 

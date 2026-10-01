@@ -1,176 +1,406 @@
-# api.py
-from fastapi.middleware.cors import CORSMiddleware
-from src.tools.observability import get_observer
-from src.graph import build_graph
+"""API HTTP do Agente de Chat Affiore.
+
+Camada de borda: valida a entrada, mantém a memória de sessão, invoca o grafo
+LangGraph e devolve a resposta. Nenhuma lógica de negócio vive aqui — ela está
+em `src/nodes/code_analyzer.py` e `src/tools/llm_tool.py`.
+
+Variáveis de ambiente relevantes (ver `.env.example`):
+    CORS_ORIGINS: lista separada por vírgula. Vazio = sem CORS (mesma origem).
+    API_AUTH_TOKEN: se definido, exige `Authorization: Bearer <token>`.
+    RATE_LIMIT_REQUESTS / RATE_LIMIT_WINDOW_SEG: teto por cliente.
+    SESSION_TTL_MINUTES / SESSION_MAX: política de memória de sessão.
+    LOG_LEVEL: nível do log da aplicação.
+"""
+import hmac
+import logging
 import os
-from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+import threading
+import time
+from collections import OrderedDict, deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from src.graph import build_graph
+from src.tools.llm_tool import provedores_desativados
+from src.tools.observability import run_scope
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
+)
+logger = logging.getLogger("affiore.api")
 
-# No topo do api.py, junto aos imports do FastAPI
+# --- Limites de entrada -------------------------------------------------------
 
-# Dicionário para guardar o estado de tempo (session_id -> datetime)
-historico_sessoes = {}
-TEMPO_EXPIRACAO_MINUTOS = 60
+MAX_MENSAGEM_CARACTERES = int(os.getenv("MAX_MENSAGEM_CARACTERES", "4000"))
+MAX_ID_SESSAO_CARACTERES = 64
+
+# --- Política de memória de sessão -------------------------------------------
+
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "60"))
+SESSION_MAX = int(os.getenv("SESSION_MAX", "1000"))
+SESSION_MAX_MENSAGENS = int(os.getenv("SESSION_MAX_MENSAGENS", "40"))
+
+# --- Rate limit --------------------------------------------------------------
+
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
+RATE_LIMIT_WINDOW_SEG = int(os.getenv("RATE_LIMIT_WINDOW_SEG", "60"))
+
+#: Instrução injetada no início de cada conversa.
+_SALUDACAO_SISTEMA = (
+    "Aviso interno: Esta é a primeira mensagem do usuário nesta interação. "
+    "Apresente-se ou inicie o fluxo adequadamente."
+)
+
+
+def _origens_cors() -> list[str]:
+    """Origens permitidas. Vazio = sem CORS, o navegador só acessa a mesma origem."""
+    bruto = os.getenv("CORS_ORIGINS", "").strip()
+    return [o.strip() for o in bruto.split(",") if o.strip()]
+
+
+class SessionStore:
+    """Memória de sessão com TTL real, teto de capacidade e acesso thread-safe.
+
+    A remoção das entradas expiradas é feita na escrita, e não apenas na leitura:
+    um `dict` cuja expiração só é consultada quando a mesma chave é lida novamente
+    cresce indefinidamente em servidores de longa vida.
+    """
+
+    def __init__(self, ttl_minutes: int, max_sessions: int, max_messages: int) -> None:
+        self._ttl = timedelta(minutes=ttl_minutes)
+        self._max_sessions = max_sessions
+        self._max_messages = max_messages
+        self._lock = threading.RLock()
+        # session_id -> (última_interação, lista de mensagens)
+        self._sessoes: OrderedDict[str, tuple[datetime, list[dict[str, str]]]] = OrderedDict()
+        # session_id -> trava, para serializar o ciclo de vida de uma conversa
+        self._trancas: OrderedDict[str, threading.Lock] = OrderedDict()
+
+    @contextmanager
+    def travar(self, session_id: str):
+        """Serializa o processamento de requisições da MESMA sessão.
+
+        Atender uma mensagem é um read-modify-write do histórico (ler, chamar o
+        LLM, gravar). Sem esta trava, duas requisições simultâneas na mesma
+        conversa leem o mesmo estado e a última gravação descarta a mensagens da
+        outra. Sessões diferentes continuam em paralelo.
+        """
+        with self._lock:
+            trava = self._trancas.get(session_id)
+            if trava is None:
+                trava = threading.Lock()
+                self._trancas[session_id] = trava
+            self._trancas.move_to_end(session_id)
+            while len(self._trancas) > self._max_sessions:
+                self._trancas.popitem(last=False)
+        trava.acquire()
+        try:
+            yield
+        finally:
+            trava.release()
+
+    def _evict_expired(self, agora: datetime) -> None:
+        expiradas = [sid for sid, (visto, _) in self._sessoes.items() if agora - visto > self._ttl]
+        for sid in expiradas:
+            del self._sessoes[sid]
+
+    def _evict_overflow(self) -> None:
+        """Descarta as sessões mais antigas até caber no teto."""
+        while len(self._sessoes) > self._max_sessions:
+            self._sessoes.popitem(last=False)
+
+    def touch(self, session_id: str) -> bool:
+        """Registra interação e devolve ``True`` se é a primeira da sessão."""
+        agora = datetime.now()
+        with self._lock:
+            self._evict_expired(agora)
+            entrada = self._sessoes.get(session_id)
+            if entrada is None:
+                self._sessoes[session_id] = (agora, [])
+                self._evict_overflow()
+                return True
+            self._sessoes[session_id] = (agora, entrada[1])
+            self._sessoes.move_to_end(session_id)
+            return False
+
+    def history(self, session_id: str) -> list[dict[str, str]]:
+        with self._lock:
+            entrada = self._sessoes.get(session_id)
+            return list(entrada[1]) if entrada else []
+
+    def set_history(self, session_id: str, mensagens: list[dict[str, str]]) -> None:
+        with self._lock:
+            entrada = self._sessoes.get(session_id)
+            visto = entrada[0] if entrada else datetime.now()
+            self._sessoes[session_id] = (visto, list(mensagens)[-self._max_messages :])
+            self._sessoes.move_to_end(session_id)
+            self._evict_overflow()
+
+    def reset(self, session_id: str) -> bool:
+        with self._lock:
+            return self._sessoes.pop(session_id, None) is not None
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "sessoes_ativas": len(self._sessoes),
+                "max_sessoes": self._max_sessions,
+                "ttl_minutes": int(self._ttl.total_seconds() // 60),
+            }
+
+
+class RateLimiter:
+    """Janela deslizante por cliente, em memória do processo.
+
+    Protege o gasto com LLM de abuso por origem única. Não substitui um
+    rate limit distribuído quando há múltiplas réplicas.
+
+    As chaves são mantidas em ordem de uso, o que permite descartar as menos
+    recentes quando o número de clientes distintos excede `max_chaves`.
+    """
+
+    def __init__(self, limite: int, janela_seg: int, max_chaves: int = 10_000) -> None:
+        self._limite = limite
+        self._janela = janela_seg
+        self._max_chaves = max_chaves
+        self._lock = threading.Lock()
+        self._eventos: OrderedDict[str, deque[float]] = OrderedDict()
+
+    def permitir(self, chave: str) -> bool:
+        agora = time.monotonic()
+        with self._lock:
+            fila = self._eventos.get(chave)
+            if fila is None:
+                fila = deque()
+                self._eventos[chave] = fila
+            self._eventos.move_to_end(chave)
+
+            while fila and agora - fila[0] > self._janela:
+                fila.popleft()
+
+            # Remove chaves ociosas para que o dicionário não cresça sem teto.
+            if len(self._eventos) > self._max_chaves:
+                for antiga in [k for k, v in self._eventos.items() if not v]:
+                    del self._eventos[antiga]
+                while len(self._eventos) > self._max_chaves:
+                    self._eventos.popitem(last=False)
+
+            if len(fila) >= self._limite:
+                return False
+            fila.append(agora)
+            return True
+
+
+# --- Aplicação ---------------------------------------------------------------
 
 app = FastAPI(
-    title="API do Agente Conversacional",
-    description="Endpoint para integração com n8n e outros sistemas externos.",
-    version="1.0.0"
+    title="Agente de Chat Affiore",
+    description="API do assistente virtual da Affiore (Arte em Presentear).",
+    version="2.0.0",
 )
 
-# Logo após instanciar: app = FastAPI(...)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Permite requisições de qualquer navegador/origem durante os testes
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_origens = _origens_cors()
+if _origens:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origens,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    )
 
-# Compila o grafo do LangGraph uma única vez na inicialização
-graph = build_graph()
+#: Grafo compilado uma única vez no boot (sem rede e sem chaves).
+grafo = build_graph()
 
-# Memória de sessões em memória (session_id -> lista de mensagens)
-session_storage: Dict[str, List[Dict[str, str]]] = {}
+sessoes = SessionStore(SESSION_TTL_MINUTES, SESSION_MAX, SESSION_MAX_MENSAGENS)
+rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SEG)
+
+TOKEN_AUTORIZACAO = os.getenv("API_AUTH_TOKEN", "").strip()
+if not TOKEN_AUTORIZACAO:
+    logger.warning(
+        "API_AUTH_TOKEN não definido: a API está ABERTA. "
+        "Defina-o antes de expor o serviço (todo /chat gera custo de LLM)."
+    )
+if not _origens:
+    logger.info("CORS desativado: defina CORS_ORIGINS para habilitar navegador cross-origin.")
 
 
-# --- Modelos de Entrada e Saída (Pydantic) ---
+# --- Modelos -----------------------------------------------------------------
+
 
 class ChatRequest(BaseModel):
-    message: str = Field(...,
-                         description="Mensagem de texto enviada pelo usuário")
+    """Mensagem do usuário para a assistente."""
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_MENSAGEM_CARACTERES,
+        description="Mensagem de texto enviada pelo usuário.",
+    )
     session_id: str = Field(
         default="default_session",
-        description="Identificador único da conversa para manter a memória"
+        max_length=MAX_ID_SESSAO_CARACTERES,
+        description="Identificador da conversa, para manter a memória.",
     )
-    metadata: Optional[Dict[str, str]] = Field(
+    metadata: dict[str, str] | None = Field(
         default=None,
-        description="Metadados adicionais opcionais repassados pelo n8n"
+        description="Metadados livres repassados pelo cliente (n8n). Não entram no LLM.",
     )
 
 
 class ChatResponse(BaseModel):
+    """Resposta da assistente."""
+
     session_id: str
     response: str
-    error: Optional[str] = None
+    provider: str | None = None
+    is_first_message: bool = False
+    error: str | None = None
 
 
-# --- Endpoints ---
+# --- Dependências ------------------------------------------------------------
+
+
+def exigir_autenticacao(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+) -> None:
+    """Exige `Authorization: Bearer <token>` quando `API_AUTH_TOKEN` está definido."""
+    if not TOKEN_AUTORIZACAO:
+        return
+    fornecido = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        fornecido = authorization[7:].strip()
+    elif x_api_key:
+        fornecido = x_api_key.strip()
+    if not secrets_compare(fornecido, TOKEN_AUTORIZACAO):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credencial ausente ou inválida.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def secrets_compare(a: str, b: str) -> bool:
+    """Comparação em tempo constante, para não vazar o token por timing."""
+    return bool(a) and hmac.compare_digest(a, b)
+
+
+# --- Endpoints ---------------------------------------------------------------
+
 
 @app.get("/health")
-def health_check():
-    """Endpoint para validação do serviço (health check)."""
-    return {"status": "ok", "agent": "active"}
+def health_check() -> dict:
+    """Verificação de disponibilidade e diagnóstico de memória de sessão.
 
-
-@app.post("/chat", response_model=ChatResponse)
-def chat_endpoint(payload: ChatRequest):
-    """Endpoint principal consumido pelo nó HTTP Request do n8n."""
-    session_id = payload.session_id.strip()
-    user_text = payload.message.strip()
-
-    if not user_text:
-        raise HTTPException(
-            status_code=400, detail="A mensagem não pode estar vazia.")
-
-    # 1. Controle de Tempo e Identificação de Primeira Mensagem
-    agora = datetime.now()
-    is_primeira_mensagem = False
-
-    if session_id not in historico_sessoes:
-        is_primeira_mensagem = True
-    else:
-        ultima_interacao = historico_sessoes[session_id]
-        # Se expirou o tempo limite, tratamos como conversa nova
-        if agora - ultima_interacao > timedelta(minutes=TEMPO_EXPIRACAO_MINUTOS):
-            is_primeira_mensagem = True
-            # Limpa a memória de mensagens antiga do LangGraph
-            if session_id in session_storage:
-                session_storage[session_id] = []
-
-    # Atualiza o relógio da última interação
-    historico_sessoes[session_id] = agora
-
-    # 2. Recupera ou cria o histórico de textos da sessão
-    if session_id not in session_storage:
-        session_storage[session_id] = []
-
-    history = session_storage[session_id]
-
-    # 3. Injeta contexto dinâmico para a IA se for o início da conversa
-    if is_primeira_mensagem:
-        print(f"🌟 NOVA CONVERSA INICIADA COM: {session_id}")
-        history.append({
-            "role": "system",
-            "content": "Aviso interno: Esta é a primeira mensagem do usuário nesta interação. Apresente-se ou inicie o fluxo adequadamente."
-        })
-    else:
-        print(f"🔄 CONTINUANDO CONVERSA COM: {session_id}")
-
-    # 4. Adiciona a nova mensagem do usuário
-    history.append({"role": "user", "content": user_text})
-
-    # 5. Prepara o estado para o LangGraph (incluindo session_id para a flag DISABLE_LLM)
-    state_input = {
-        "session_id": session_id,
-        "messages": history,
-        "is_first_message": is_primeira_mensagem,
-        "response": "",
-        "error_message": ""
+    `provedores.desativados` é o único lugar onde o operador enxerga que uma
+    chave de LLM morreu e o agente está degradado para um provedor só. O
+    cliente do chat não recebe nada disso: aqui é diagnóstico de infraestrutura.
+    """
+    desativados = provedores_desativados()
+    return {
+        "status": "ok" if not desativados else "degraded",
+        "service": "agente-chat-affiore",
+        "sessoes": sessoes.stats(),
+        "provedores": {
+            "desativados": desativados,
+            "motivo": "credencial inválida, sem crédito ou limite excedido",
+            "como_recuperar": "corrigir a chave e reiniciar o processo",
+        },
     }
 
-    # 6. Registra observabilidade
-    observer = get_observer()
-    run_id = observer.start_run()
 
-    try:
-        # Executa o grafo
-        result_state = graph.invoke(state_input)
+@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(exigir_autenticacao)])
+def chat_endpoint(payload: ChatRequest, request: Request) -> ChatResponse:
+    """Atende uma mensagem do usuário.
 
-        if result_state.get("error_message"):
-            observer.finish_run(status="error")
-            return ChatResponse(
-                session_id=session_id,
-                response="",
-                error=result_state["error_message"]
-            )
-
-        # 7. Atualiza o histórico em memória e extrai a resposta
-        session_storage[session_id] = result_state.get("messages", history)
-
-        # Pega a resposta gerada (seja da LLM, mensagem estática ou "" quando silenciado)
-        resposta_gerada = result_state.get("response", "")
-        if not resposta_gerada and session_storage[session_id] and session_storage[session_id][-1].get("role") == "assistant":
-            resposta_gerada = session_storage[session_id][-1].get(
-                "content", "")
-
-        observer.finish_run(status="ok")
-
-        return ChatResponse(
-            session_id=session_id,
-            response=resposta_gerada,
-            error=None
-        )
-
-    except Exception as e:
-        observer.finish_run(status="crashed")
+    Resposta de negócio com erro sai em HTTP 200 com ``error`` preenchido — é o
+    que o `chat.html` consome. Falha inesperada sai em HTTP 500 sem vazar
+    detalhe interno.
+    """
+    cliente = request.client.host if request.client else "desconhecido"
+    if not rate_limiter.permitir(cliente):
+        logger.warning("Rate limit excedido para %s.", cliente)
         raise HTTPException(
-            status_code=500,
-            detail=f"Erro interno durante a execução do agente: {str(e)}"
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Muitas requisições. Aguarde alguns instantes.",
+            headers={"Retry-After": str(RATE_LIMIT_WINDOW_SEG)},
         )
 
+    session_id = payload.session_id.strip() or "default_session"
+    texto = payload.message.strip()
 
-@app.delete("/chat/{session_id}")
-def reset_session(session_id: str):
-    """Endpoint para limpar a memória de uma sessão específica."""
-    if session_id in session_storage:
-        del session_storage[session_id]
-    if session_id in historico_sessoes:
-        del historico_sessoes[session_id]
-    return {"message": f"Sessão {session_id} resetada com sucesso."}
+    if not texto:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="A mensagem não pode estar vazia."
+        )
+    if payload.metadata:
+        logger.debug("Metadados recebidos (não repassados ao LLM): %s", payload.metadata.keys())
+
+    # O ciclo inteiro da conversa (ler histórico -> LLM -> gravar) fica sob a
+    # trava da sessão: é um read-modify-write e, sem serialização, duas
+    # requisições simultâneas na mesma conversa se sobrescrevem.
+    with sessoes.travar(session_id):
+        primeira = sessoes.touch(session_id)
+        historico = sessoes.history(session_id)
+
+        if primeira:
+            logger.info("Nova sessão: %s", session_id)
+            historico = [
+                {"role": "system", "content": _SALUDACAO_SISTEMA},
+                *historico,
+            ]
+        else:
+            logger.debug("Sessão em andamento: %s", session_id)
+
+        historico = [*historico, {"role": "user", "content": texto}]
+
+        estado = {
+            "session_id": session_id,
+            "messages": historico,
+            "is_first_message": primeira,
+            "response": "",
+            "error_message": "",
+        }
+
+        with run_scope(session_id=session_id) as observador:
+            try:
+                resultado = grafo.invoke(estado)
+            except Exception:
+                observador.finish_run(status="crashed")
+                logger.exception("Falha inesperada ao invocar o grafo (sessão %s).", session_id)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Falha interna ao processar a mensagem.",
+                ) from None
+
+            mensagens = resultado.get("messages") or historico
+            sessoes.set_history(session_id, mensagens)
+            erro = resultado.get("error_message") or ""
+            if erro:
+                observador.finish_run(status="error")
+
+    return ChatResponse(
+        session_id=session_id,
+        response=resultado.get("response", ""),
+        is_first_message=primeira,
+        error=erro or None,
+    )
+
+
+@app.delete("/chat/{session_id}", dependencies=[Depends(exigir_autenticacao)])
+def reset_session(session_id: str) -> dict:
+    """Limpa a memória de uma sessão. Devolve `removed: false` se não existia."""
+    alvo = session_id.strip()
+    with sessoes.travar(alvo):
+        removida = sessoes.reset(alvo)
+    logger.info("Reset de sessão %s (removida=%s).", alvo, removida)
+    return {"session_id": alvo, "removed": removida}

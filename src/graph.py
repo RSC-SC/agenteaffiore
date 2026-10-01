@@ -1,48 +1,56 @@
-# src/graph.py
+"""Montagem do grafo LangGraph do Agente Affiore.
+
+O grafo é linear: entrada → `responder_chat` → END. A instrumentação de
+observabilidade é aplicada centralmente em `build_graph()`, para que os nós
+mantenham-se focados na lógica de negócio.
+"""
+import functools
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
+
 from langgraph.graph import END, StateGraph
 
-# REAPROVEITADO: Importando a função do nó diretamente de code_analyzer.py
 from src.nodes.code_analyzer import responder_chat
 from src.state import ChatState
 from src.tools.observability import get_observer
 
+NoEstado = ChatState
+ResultadoNo = dict
 
-def _instrumented(name: str, fn: Callable) -> Callable:
-    """Envolve o nó com os sinais de observabilidade existentes."""
-    def wrapped(state: ChatState):
-        obs = get_observer()
-        obs.node_started(name)
-        t0 = time.perf_counter()
+
+def _instrumentado(nome: str, fn: Callable[[NoEstado], ResultadoNo]) -> Callable[[NoEstado], ResultadoNo]:
+    """Envolve um nó com os sinais de observabilidade (latência e erros)."""
+
+    @functools.wraps(fn)
+    def envolvido(state: NoEstado) -> ResultadoNo:
+        observador = get_observer()
+        observador.node_started(nome)
+        inicio = time.perf_counter()
         try:
-            result = fn(state) or {}
-        except Exception as e:
-            obs.node_finished(
-                name, (time.perf_counter() - t0) * 1000, "exception", error=str(e),
+            resultado = fn(state)
+        except Exception as exc:
+            observador.node_finished(
+                nome, (time.perf_counter() - inicio) * 1000, "exception", error=str(exc)
             )
             raise
-        duration_ms = (time.perf_counter() - t0) * 1000
-        node_error = str(result.get("error_message", "") or "")
-        status = "error" if node_error else "ok"
-        if node_error:
-            obs.log_error(name, node_error)
-        obs.node_finished(
-            name, duration_ms, status, error=node_error
-        )
-        return result
-    return wrapped
+        if not isinstance(resultado, dict):
+            raise TypeError(
+                f"O nó {nome!r} deve devolver um dict, recebeu {type(resultado).__name__}."
+            )
+        latencia_ms = (time.perf_counter() - inicio) * 1000
+        erro_no = str(resultado.get("error_message") or "")
+        if erro_no:
+            observador.log_error(nome, erro_no)
+        observador.node_finished(nome, latencia_ms, "error" if erro_no else "ok", error=erro_no)
+        return resultado
+
+    return envolvido
 
 
-def build_graph() -> StateGraph:
-    """Monta o grafo conversacional linear."""
-    builder = StateGraph(ChatState)
-
-    # Registra o nó utilizando a LLM do code_analyzer com observabilidade
-    builder.add_node("responder_chat", _instrumented("responder_chat", responder_chat))
-
-    # Fluxo direto: Início -> responder_chat -> END
-    builder.set_entry_point("responder_chat")
-    builder.add_edge("responder_chat", END)
-
-    return builder.compile()
+def build_graph():
+    """Compila o grafo conversacional. Não faz rede nem exige chaves de API."""
+    construtor = StateGraph(ChatState)
+    construtor.add_node("responder_chat", _instrumentado("responder_chat", responder_chat))
+    construtor.set_entry_point("responder_chat")
+    construtor.add_edge("responder_chat", END)
+    return construtor.compile()

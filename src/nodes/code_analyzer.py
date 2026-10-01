@@ -1,257 +1,156 @@
-# src/nodes/code_analyzer.py
+"""Nó conversacional do Agente Affiore.
+
+Responsabilidades: montar o prompt da marca, converter o histórico do estado
+em mensagens LangChain e devolver a resposta. A escolha de provedor e o
+tool-calling ficam em `src/tools/llm_tool.py`; os dados de catálogo e as tools
+em `src/tools/affiore_tool.py`.
+"""
 import logging
 import os
-import time
-from typing import Any, Dict, Optional, Set
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.tools import tool
+from collections import OrderedDict
+from typing import Any
 
-# Links dos catálogos no Google Drive fornecidos
-CATALOGOS_LINKS = {
-    "catalogo_principal": "https://drive.google.com/file/d/1jdaGna6hmyQN5ErcPUBjI7rsoFL3UUUU/view?usp=drive_link",
-    "catalogo_complementar": "https://drive.google.com/file/d/13fG-tHpdHBd2WqynAk9PZ2ci8TOcFnv1/view?usp=drive_link"
-}
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from src.state import ChatState
+from src.tools.llm_tool import (
+    NenhumProvedorDisponivel,
+    TodosProvedoresFalharam,
+    chat,
+)
 
 logger = logging.getLogger(__name__)
 
-# Controle em memória das sessões que já receberam a resposta padrão
-_SESSOES_RESPONDIDAS: Set[str] = set()
+# Capacidade do registro de sessões já atendidas no modo DISABLE_LLM. Um set
+# sem limite cresceria indefinidamente em servidor de longa vida.
+MAX_SESSOES_REGISTRADAS = 10_000
+
+# Controle em memória das sessões que já receberam a resposta padrão.
+_sessoes_respondidas: OrderedDict[str, None] = OrderedDict()
 
 
-@tool
-def obter_links_catalogo() -> str:
-    """Útil para quando o cliente solicitar o catálogo, menu completo em PDF, 
-    fotos ou desejar ver as opções completas da Affiore no Google Drive."""
-    return (
-        "Aqui estão os links oficiais dos nossos catálogos completos da Affiore:\n"
-        f"• Catálogo Geral & Presentes: {CATALOGOS_LINKS['catalogo_principal']}\n"
-        f"• Catálogo Complementar: {CATALOGOS_LINKS['catalogo_complementar']}\n"
-        "Fique à vontade para explorar todos os detalhes com carinho!"
+def _registrar_sessao(session_id: str) -> None:
+    _sessoes_respondidas[session_id] = None
+    _sessoes_respondidas.move_to_end(session_id)
+    while len(_sessoes_respondidas) > MAX_SESSOES_REGISTRADAS:
+        _sessoes_respondidas.popitem(last=False)
+
+
+def _system_prompt() -> str:
+    """Monta o prompt da Affiore a partir dos dados oficiais de catálogo."""
+    from src.tools.affiore_tool import (  # import local evita ciclo com llm_tool
+        CATALOGO_COMPLEMENTAR,
+        CATALOGO_PRINCIPAL,
+        tabela_precos,
     )
 
-
-TOOL_MAP = {"obter_links_catalogo": obter_links_catalogo}
-
-SYSTEM_PROMPT_AFFIORE = f"""Você é a assistente virtual da Affiore (Arte em Presentear).
+    return f"""Você é a assistente virtual da Affiore (Arte em Presentear).
 Seu objetivo é atender clientes no WhatsApp de forma acolhedora, afetuosa, elegante e ágil.
 
 Sobre a Affiore:
-- Especializada em cestas de café da manhã, boxes de frios, vinhos, kits spa e presentes corporativos.
-- Valoriza o afeto em cada detalhe e conta com curadoria de nutricionista (adaptamos para restrições alimentares como opções sem glúten ou lactose sob consulta).
-- Todos os produtos possuem taxa de entrega calculada à parte de acordo com a região.
+- Especializada em cesta de café da manhã, boxes de frios, vinhos, kits spa e presentes corporativos.
+- Valoriza o afeto em cada detalhe e conta com curadoria de nutricionista (adaptamos para
+  restrições alimentares, como opções sem glúten ou lactose, sob consulta).
+- Todos os produtos possuem taxa de entrega calculada à parte, de acordo com a região.
 
-Catálogos Oficiais no Google Drive:
-- Catálogo Geral & Presentes: {CATALOGOS_LINKS['catalogo_principal']}
-- Catálogo Complementar: {CATALOGOS_LINKS['catalogo_complementar']}
+Catálogos oficiais no Google Drive:
+- Catálogo Geral & Presentes: {CATALOGO_PRINCIPAL}
+- Catálogo Complementar: {CATALOGO_COMPLEMENTAR}
 
-Diretrizes de Atendimento:
-1. Seja sempre cordial e atenciosa, utilizando saudações calorosas condizentes com a marca.
-2. Quando o cliente pedir para ver o catálogo, fotos ou perguntar sobre os produtos de forma ampla, utilize a ferramenta `obter_links_catalogo` (ou forneça diretamente os links acima) e envie os links do Google Drive.
-3. Se o cliente perguntar os preços diretamente, forneça os valores oficiais com clareza:
-   - Box Café Seleto: R$ 89,00
-   - Mini Box Frios: R$ 89,90
-   - Box Afeto e Flores: R$ 209,00
-   - Kit Spa: R$ 259,00
-   - Affiore Celebrar (Cerveja artesanal IPA): R$ 359,00
-   - Box Vinho Affiore (Casillero del Diablo): R$ 389,00
-   - Tábuas de Frios: PP (R$ 159,00), P (R$ 199,00), M (R$ 279,00), G (R$ 359,00)
-4. Destaque os itens personalizáveis: o cartão de mensagem é cortesia, e itens como canecas com inicial, fotos polaroid, balões e flores podem ser adicionados.
-5. Sempre lembre de perguntar para quando seria a entrega e qual a ocasião (aniversário, agradecimento, brinde a dois), para ajudar o cliente a escolher o melhor presente.
-"""
+Diretrizes de atendimento:
+1. Seja sempre cordial e atenciosa, com saudações condizentes com a marca.
+2. Quando o cliente pedir catálogo, fotos, cardápio ou a lista completa de produtos, use a
+   ferramenta `obter_links_catalogo` e envie os links do Google Drive.
+3. Se o cliente perguntar preços, informe os valores oficiais:
+{tabela_precos()}
+4. Destaque os itens personalizáveis: o cartão de mensagem é cortesia, e itens como canecas
+   com inicial, fotos polaroid, balões e flores podem ser adicionados.
+5. Pergunte sempre para quando seria a entrega e qual a ocasião (aniversário, agradecimento,
+   brinde a dois), para ajudar o cliente a escolher o melhor presente.
+6. Não invente produtos, preços, prazos ou condições que não estejam nas informações acima.
+   Se não souber, ofereça o catálogo e sugira falar com um atendente humano."""
 
 
-def _try_gemini() -> Optional[BaseChatModel]:
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        return None
+def _para_mensagens_lc(historico: list[dict[str, str]]) -> list:
+    """Converte o histórico do estado em mensagens LangChain."""
+    formato = [SystemMessage(content=_system_prompt())]
+    for mensagem in historico:
+        papel = mensagem.get("role")
+        conteudo = mensagem.get("content", "")
+        if papel in ("user", "human"):
+            formato.append(HumanMessage(content=conteudo))
+        elif papel in ("assistant", "ai"):
+            formato.append(AIMessage(content=conteudo))
+    return formato
+
+
+def _flag_ativa(nome_var: str) -> bool:
+    return (os.getenv(nome_var) or "").strip().lower() in {"true", "1", "yes"}
+
+
+def _resposta_de_emergencia(state: ChatState, session_id: str) -> dict[str, Any]:
+    """Resposta padrão usada quando `DISABLE_LLM` está ativo (modo de contingência)."""
+    if session_id in _sessoes_respondidas:
+        logger.info("DISABLE_LLM ativo: sessão %s já atendida. Silenciando.", session_id)
+        return {**state, "response": "", "error_message": ""}
+
+    _registrar_sessao(session_id)
+    mensagem = os.getenv(
+        "STATIC_RESPONSE_MESSAGE",
+        "Olá! Nosso atendimento automático está temporariamente indisponível. "
+        "Em breve um atendente irá falar com você!",
+    )
+    logger.info("DISABLE_LLM ativo: mensagem padrão para a sessão %s", session_id)
+    return {
+        **state,
+        "messages": [
+            *state.get("messages", []),
+            {"role": "assistant", "content": mensagem},
+        ],
+        "response": mensagem,
+        "error_message": "",
+    }
+
+
+def responder_chat(state: ChatState) -> dict[str, Any]:
+    """Nó do agente: gera uma resposta conversacional a partir do estado.
+
+    Sempre devolve um dicionário completo com ``messages``, ``response`` e
+    ``error_message``. Erros de provedor viram mensagem amigável em
+    ``error_message``, nunca exceção com detalhe interno.
+    """
+    historico = state.get("messages") or []
+    if not historico:
+        return {**state, "response": "", "error_message": "Nenhuma mensagem recebida."}
+
+    session_id = state.get("session_id") or "default_session"
+
+    if _flag_ativa("DISABLE_LLM"):
+        return _resposta_de_emergencia(state, session_id)
+
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        model = os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
-        return ChatGoogleGenerativeAI(
-            model=model,
-            google_api_key=api_key
-        )
-    except Exception as e:
-        logger.debug(f"Falha ao carregar Gemini: {e}")
-        return None
-
-
-def _try_openrouter() -> Optional[BaseChatModel]:
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-        model = os.getenv("OPENROUTER_MODEL",
-                          "nvidia/nemotron-3-super-120b-a12b:free")
-        return ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-            default_headers={
-                "HTTP-Referer": "https://github.com/RSC-SC/IADev-MiniProj-Mod2",
-                "X-Title": "Agente Revisor de PRs"
-            }
-        )
-    except Exception as e:
-        logger.debug(f"Falha ao carregar OpenRouter: {e}")
-        return None
-
-
-def _try_groq() -> Optional[BaseChatModel]:
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        return ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",
-            default_headers={
-                "HTTP-Referer": "https://github.com/RSC-SC/IADev-MiniProj-Mod2",
-                "X-Title": "Agente Revisor de PRs"
-            }
-        )
-    except Exception as e:
-        logger.debug(f"Falha ao carregar groq: {e}")
-        return None
-
-
-def _get_providers():
-    providers = [
-        ("Gemini", _try_gemini),
-        ("GROQ", _try_groq),
-        ("OpenRouter", _try_openrouter)
-    ]
-    primary = (os.getenv("LLM_PRIMARY_PROVIDER") or "gemini").strip().lower()
-    if primary == "openrouter":
-        providers = [("OpenRouter", _try_openrouter), ("Gemini", _try_gemini), ("GROQ", _try_groq)]
-    elif primary == "groq":
-        providers = [("GROQ", _try_groq), ("Gemini", _try_gemini), ("OpenRouter", _try_openrouter)]
-    elif primary != "gemini":
-        logger.debug(
-            "LLM_PRIMARY_PROVIDER inválido: '%s'. Usando padrão (gemini).",
-            primary,
-        )
-    return providers
-
-
-def responder_chat(state: dict) -> dict:
-    """Nó do agente que reage conversando com o usuário usando os provedores com fallback ou modo estático."""
-    messages = state.get("messages", [])
-    if not messages:
-        return {"error_message": "Nenhuma mensagem recebida no estado."}
-
-    session_id = state.get("session_id", "default_session")
-
-    # ==========================================
-    # VERIFICAÇÃO DA FLAG DISABLE_LLM
-    # ==========================================
-    disable_llm = os.getenv("DISABLE_LLM", "false").strip().lower() in ["true", "1", "yes"]
-
-    if disable_llm:
-        if session_id in _SESSOES_RESPONDIDAS:
-            logger.info("DISABLE_LLM ativo: sessão %s já foi respondida. Silenciando.", session_id)
-            return {
-                **state,
-                "response": "",
-                "error_message": ""
-            }
-
-        # Primeira vez nesta sessão: envia a mensagem padrão e marca no set
-        _SESSOES_RESPONDIDAS.add(session_id)
-        msg_estatica = os.getenv(
-            "STATIC_RESPONSE_MESSAGE",
-            "Olá! Nosso atendimento automático está temporariamente indisponível. Em breve um atendente irá falar com você!"
-        )
-        logger.info("DISABLE_LLM ativo: enviando mensagem padrão para sessão %s", session_id)
+        texto, provedor = chat(_para_mensagens_lc(historico))
+    except NenhumProvedorDisponivel as exc:
+        # Cobre "nenhuma chave configurada" e "toda chave morta por credencial".
+        # A mensagem do cliente é a mesma; o técnico lê a exceção, que nomeia os
+        # provedores desativados quando é o caso.
+        logger.error("Sem provedor de LLM utilizável (sessão %s): %s", session_id, exc)
         return {
             **state,
-            "messages": messages + [{"role": "assistant", "content": msg_estatica}],
-            "response": msg_estatica,
-            "error_message": ""
+            "response": "",
+            "error_message": "Atendimento temporariamente indisponível.",
         }
-
-    # ==========================================
-    # FLUXO PADRÃO COM LLM
-    # ==========================================
-    formatted_messages = [SystemMessage(content=SYSTEM_PROMPT_AFFIORE)]
-
-															  
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content", "")
-        if role in ["user", "human"]:
-            formatted_messages.append(HumanMessage(content=content))
-        elif role in ["assistant", "ai"]:
-            formatted_messages.append(AIMessage(content=content))
-
-																								  
-    last_error = ""
-    for name, provider_factory in _get_providers():
-        try:
-            model_instance = provider_factory()
-            if model_instance is None:
-                continue
-
-            logger.debug("Tentando responder via provedor: %s", name)
-
-																										 
-            if name in ["Gemini", "GROQ"]:
-                active_llm = model_instance.bind_tools([obter_links_catalogo])
-            else:
-                active_llm = model_instance
-
-            response = active_llm.invoke(formatted_messages)
-
-																	
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                mensagens_com_tools = list(formatted_messages) + [response]
-
-                for call in response.tool_calls:
-                    tool_name = call.get("name")
-                    tool_args = call.get("args", {})
-                    tool_id = call.get("id")
-
-                    tool_fn = TOOL_MAP.get(tool_name)
-                    if tool_fn:
-                        try:
-                            tool_result = tool_fn.invoke(tool_args)
-                        except Exception as e:
-                            tool_result = f"Erro ao acessar links: {e}"
-
-                        mensagens_com_tools.append(
-                            ToolMessage(
-                                tool_call_id=tool_id,
-                                content=str(tool_result),
-                                name=tool_name
-                            )
-                        )
-
-                final_response = active_llm.invoke(mensagens_com_tools)
-                ai_reply = final_response.content if hasattr(final_response, "content") else str(final_response)
-            else:
-                ai_reply = response.content if hasattr(response, "content") else str(response)
-
-																 
-            return {
-                **state,
-                "messages": messages + [{"role": "assistant", "content": ai_reply}],
-                "response": ai_reply,
-                "error_message": ""
-            }
-        except Exception as e:
-																 
-            logger.debug("Falha interna ao tentar provedor %s: %s", name, e)
-            last_error = f"{name}: {e}"
-
-																
-    logger.error("Todos os provedores falharam. Último erro: %s", last_error)
+    except TodosProvedoresFalharam:
+        logger.error("Todos os provedores falharam (sessão %s).", session_id, exc_info=True)
+        return {
+            **state,
+            "response": "",
+            "error_message": "Não conseguimos responder agora. Tente novamente em instantes.",
+        }
 
     return {
         **state,
-        "error_message": f"Nenhum provedor de LLM disponível ou funcional. Último erro: {last_error}"
+        "messages": [*historico, {"role": "assistant", "content": texto}],
+        "response": texto,
+        "error_message": "",
     }
