@@ -1,10 +1,11 @@
-# CI — Projeto Final Módulo 2 (Fase 5 — DevOps Inteligente, Issue #7)
+# CI — Agente de Chat Affiore
 #
-# Pipeline com 3 etapas independentes (lint, testes, build/validação).
-# Os testes são 100% offline (suíte da Fase 4), então NENHUM segredo é
-# necessário aqui — redução de superfície de ataque do próprio pipeline.
-# Cada etapa salva seu log como artefato para análise posterior por IA
-# (ver docs/evidencias/fase5_devops.md).
+# Três etapas independentes (lint, testes, build) mais a validação da imagem.
+# A suíte é 100% offline por construção: os provedores de LLM são mockados,
+# então NENHUM segredo é necessário no pipeline — o que reduz a superfície de
+# de ataque do próprio CI.
+#
+# Fluxo de branches conforme AGENTS.md: feature/* -> develop -> main.
 
 name: CI
 
@@ -12,7 +13,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [develop]
+    branches: [develop, main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -27,7 +28,9 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Instalar dependências
         run: pip install -r requirements-dev.txt
@@ -52,15 +55,17 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Instalar dependências
         run: pip install -r requirements-dev.txt
 
-      - name: Rodar suíte offline (102 testes)
+      - name: Rodar suíte offline com cobertura
         run: |
           set -o pipefail
-          python -m pytest tests -v 2>&1 | tee pytest_output.txt
+          python -m pytest tests -v --cov=src --cov=api --cov-report=term-missing 2>&1 | tee pytest_output.txt
 
       - name: Salvar log dos testes como artefato
         if: always()
@@ -69,7 +74,7 @@ jobs:
           name: log-pytest
           path: pytest_output.txt
 
-  build-validate:
+  build:
     name: Build e validação
     runs-on: ubuntu-latest
     steps:
@@ -77,7 +82,9 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Instalar dependências de produção
         run: pip install -r requirements.txt
@@ -85,12 +92,32 @@ jobs:
       - name: Byte-compilar todos os módulos
         run: |
           set -o pipefail
-          python -m compileall -q src main.py 2>&1 | tee build_output.txt
+          python -m compileall -q src api.py main.py 2>&1 | tee build_output.txt
 
       - name: Smoke de importação (grafo compila sem rede/chaves)
         run: |
           set -o pipefail
-          python -c "from src.graph import build_graph; app = build_graph(); print('Grafo compilado:', type(app).__name__)" 2>&1 | tee build_output.txt
+          python -c "
+          from src.graph import build_graph
+          grafo = build_graph()
+          print('Grafo compilado:', type(grafo).__name__)
+          print('Nos:', sorted(grafo.get_graph().nodes))
+          " 2>&1 | tee -a build_output.txt
+
+      - name: Smoke da API (rotas registradas sem rede)
+        run: |
+          set -o pipefail
+          python -c "
+          import api
+          rotas = sorted(r.path for r in api.app.routes if hasattr(r, 'path') and not r.path.startswith('/openapi'))
+          print('Rotas:', rotas)
+          assert '/chat' in rotas and '/health' in rotas
+          " 2>&1 | tee -a build_output.txt
+
+      - name: Validar Dockerfile (build da imagem)
+        run: |
+          set -o pipefail
+          docker build -t affiore-chat:ci . 2>&1 | tee -a build_output.txt
 
       - name: Salvar log do build como artefato
         if: always()

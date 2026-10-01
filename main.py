@@ -1,63 +1,89 @@
-# main.py
+"""CLI do Agente de Chat Affiore — interação local, sem passar pela API HTTP.
+
+Uso:
+    python main.py
+
+Útil para depurar o grafo e ajustar o prompt sem subir o FastAPI. A memória é
+apenas da sessão do terminal.
+"""
+import logging
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.graph import build_graph
-from src.tools.observability import get_observer
+from src.graph import build_graph  # noqa: E402  (load_dotenv precisa vir antes)
+from src.tools.observability import run_scope  # noqa: E402
 
-def main():
-    graph = build_graph()
-    observer = get_observer()
+logger = logging.getLogger("affiore.cli")
 
-    run_id = observer.start_run()
-    print(f"[obs] Sessão de chat iniciada | run_id={run_id}")
-    print("=" * 60)
-    print("💬 Agente Chat ativo! Digite sua mensagem (ou 'sair' para encerrar):")
-    print("=" * 60)
+COMANDOS_SAIDA = {"sair", "exit", "quit", "sai"}
+SEPARADOR = "=" * 60
 
-    state = {
+
+def main() -> int:
+    """Executa o loop conversacional. Devolve o código de saída do processo."""
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(levelname)-8s %(message)s",
+    )
+    grafo = build_graph()
+
+    print(SEPARADOR)
+    print("💬 Agente Chat Affiore — digite sua mensagem (ou 'sair' para encerrar)")
+    print(SEPARADOR)
+
+    estado = {
+        "session_id": "cli",
         "messages": [],
-        "error_message": ""
+        "is_first_message": True,
+        "response": "",
+        "error_message": "",
     }
 
-    status = "ok"
-    try:
+    with run_scope(session_id="cli") as observador:
         while True:
-            user_input = input("\nVocê: ").strip()
-
-            if not user_input:
-                continue
-
-            if user_input.lower() in ["sair", "exit", "quit"]:
-                print("\nEncerrando conversa...")
+            try:
+                entrada = input("\nVocê: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nSessão finalizada pelo usuário.")
                 break
 
-            # 1. Adiciona a mensagem do usuário ao histórico
-            state["messages"].append({"role": "user", "content": user_input})
+            if not entrada:
+                continue
+            if entrada.lower() in COMANDOS_SAIDA:
+                print("\nEncerrando conversa.")
+                break
 
-            # 2. Executa o grafo chamando a LLM de code_analyzer.py
-            state = graph.invoke(state)
+            estado["messages"] = [
+                *estado.get("messages", []),
+                {"role": "user", "content": entrada},
+            ]
 
-            # 3. Exibe a réplica gerada
-            if state.get("error_message"):
-                print(f"[Aviso]: {state['error_message']}")
+            try:
+                estado = grafo.invoke(estado)
+            except Exception:
+                observador.finish_run(status="crashed")
+                logger.exception("Falha ao invocar o grafo.")
+                print("\n[Erro] Falha interna ao processar a mensagem. Encerrando.")
+                return 1
+
+            estado["is_first_message"] = False
+            erro = estado.get("error_message")
+            if erro:
+                print(f"\nAssistente: [{erro}]")
             else:
-                ultima_resposta = state["messages"][-1]["content"]
-                print(f"\nAssistente: {ultima_resposta}")
+                print(f"\nAssistente: {estado.get('response', '')}")
 
-    except (KeyboardInterrupt, EOFError):
-        print("\nSessão finalizada pelo usuário.")
-    except Exception as e:
-        status = "crashed"
-        print(f"\n[Erro fatal]: {e}")
-    finally:
-        paths = observer.finish_run(status=status)
-        print("\n" + "=" * 60)
-        if isinstance(paths, dict) and "structured_log" in paths:
-            print(f"[obs] Registros gravados em: {paths['structured_log']}")
-        print("=" * 60)
+        caminhos = observador.finish_run(status="ok")
+
+    print(f"\n{SEPARADOR}")
+    print(f"[obs] Log estruturado: {caminhos['structured_log']}")
+    print(f"[obs] Auditoria      : {caminhos['audit']}")
+    print(SEPARADOR)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

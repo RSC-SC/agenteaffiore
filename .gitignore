@@ -1,62 +1,48 @@
-# Build artifacts
-build/
-bin/
-gen/
-out/
-.gradle/
-
-# IDE files (IntelliJ / Android Studio)
-.idea/
-*.iml
-*.iws
-*.ipr
-
-# Local configuration files
-local.properties
-.DS_Store
-
-# Captures and logs
-captures/
-*.log
-
-# Keystore files (NEVER commit these)
-*.jks
-*.keystore
-*.p12
-
-# Google Services
-google-services.json
-
-# Crashlytics
-com_crashlytics_export_strings.xml
-
-# Python
+# --- Python -------------------------------------------------------------------
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
-dist/
-build/
 .eggs/
-venv/
+build/
+dist/
+
+# Ambientes virtuais
 .venv/
+venv/
 env/
+ENV/
 
-# Environment variables (nunca commitar .env real)
+# --- Ferramentas ---------------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+
+# --- Configuração local ---------------------------------------------------------
+# Segredos: NUNCA versionar. Só .env.example entra no repositório.
 .env
+.env.*
+!.env.example
 
-# Project specific files
+# --- Artefatos de execução --------------------------------------------------------
+# Observabilidade: JSONL + auditoria gerados a cada requisição.
+logs/
+
+# --- Sistema operacional / editores ----------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Materiais do curso (fora do repositório) --------------------------------------
 Mini-Projeto Mod2.pdf
 Mini-Projeto Mod2.md
 Projeto Final Mod2.pdf
 Projeto Final Mod2.md
 LLM.md
-AGENTS.md
-
-# Roteiro do vídeo de apresentação (material de gravação, fora do repositório)
-docs/ROTEIRO_VIDEO.md
-
-# Review history (JSON gerado automaticamente)
-reviews/
-
-# Observabilidade (JSONL/auditoria gerados a cada execução)
-logs/

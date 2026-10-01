@@ -1,5 +1,8 @@
-# Dependencias de desenvolvimento/QA (Fase 4 — QA Inteligente)
-# Instalacao: pip install -r requirements-dev.txt
+# Dependências de desenvolvimento e QA.
+# Instalação: pip install -r requirements-dev.txt
 -r requirements.txt
+
 pytest>=8.0
-ruff>=0.6  # Fase 5: lint no pipeline CI
+pytest-cov>=5.0
+ruff>=0.6
+httpx>=0.27  # cliente usado por fastapi.testclient nos testes da API

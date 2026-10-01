@@ -2,10 +2,17 @@ __pycache__
 *.pyc
 *.pyo
 *.pyd
+*.egg-info
 .git
 .gitignore
+.github
 .env
 .venv
 venv
 logs/
+reviews/
 .pytest_cache
+.ruff_cache
+.htmlcov
+tests/
+README.md

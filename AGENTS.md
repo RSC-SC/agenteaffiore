@@ -1,105 +1,102 @@
-# Fluxo de Desenvolvimento (Instruções para o Agente IA)
+# AGENTS.md — Instruções para o Agente IA
 
-Sempre que for realizada uma alteração no código deste projeto, o seguinte fluxo DEVE ser seguido:
+> Contexto do projeto, decisões e fluxo de trabalho para agentes de código.
+> Lido automaticamente no início de cada sessão.
 
-## Fluxo Obrigatório
+## O que é este projeto
 
-1. **Criar Issue no GitHub**
-   - Descrever a tarefa com título e descrição claros
-   - Adicionar labels se aplicável
+**Agente de Chat Affiore** — assistente virtual da Affiore (Arte em Presentear),
+que atende clientes e envia os links do catálogo. Grafo LangGraph + FastAPI.
 
-2. **Criar branch a partir de `develop`**
-   - Nome padrão: `feature/<descricao-curta>`, `fix/<descricao-curta>` ou `docs/<descricao-curta>`
+Servido por `api.py` (HTTP) ou `main.py` (CLI). Interface de demonstração em
+`chat.html`.
 
-3. **Implementar a alteração**
-   - Fazer checkout na branch criada
-   - Implementar o código conforme definido na Issue
+## Regras invioláveis
 
-4. **Commit**
-   - Usar mensagens semânticas claras (ex: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`)
+1. **Nunca versionar segredos.** `.env` está no `.gitignore`; só `.env.example`
+   entra no repositório.
+2. **A fonte única de cada dado é um só arquivo.** Preços e links do catálogo
+   vivem só em `src/tools/affiore_tool.py`. Provedores e modelos de LLM vivem só
+   em `src/tools/llm_tool.py`. Não redefina nem duplique.
+3. **O que chega ao cliente nunca carrega detalhe interno.** Erros de provedor
+   viram mensagem amigável; o técnico vai para o log. Não há `str(e)` na
+   resposta HTTP.
+4. **Tool-calling é delimitado.** `MAX_TOOL_ROUNDS` impede laço infinito.
+5. **A suíte é 100% offline.** Nenhum teste toca rede ou exige credencial — é o
+   que permite rodar o CI sem segredos.
+6. **Nada de `except: pass` silencioso.** Falha de escrita de log é
+   `logger.warning(..., exc_info=True)`, nunca descarte.
 
-5. **Criar Pull Request para `develop`**
-   - PR deve referenciar a Issue (ex: `Closes #1`)
-   - Descrever as mudanças realizadas
+## Fluxo de desenvolvimento (obrigatório)
 
-6. **Documentar na Issue**
-   - Atualizar a Issue com o link do PR e status da implementação
+1. **Criar Issue no GitHub** — título, descrição clara, labels.
+2. **Branch a partir de `develop`** — `feature/`, `fix/` ou `docs/`.
+3. **Implementar** na branch criada.
+4. **Commit** — mensagens semânticas (`feat:`, `fix:`, `refactor:`, `docs:`,
+   `chore:`, `test:`).
+5. **PR para `develop`** — referenciando a Issue (`Closes #N`) e descrevendo as
+   mudanças.
+6. **Atualizar a Issue** com o link do PR e o status.
+7. **Integração** — `feature/*` → `develop` → `main`.
 
-7. **Integração**
-   - `feature/*` → `develop` (via PR)
-   - `develop` → `main` apenas em marcos estáveis (versão final obrigatoriamente na `main`)
+## Portões de qualidade (o CI falha se qualquer um falhar)
 
----
+```bash
+python -m pytest tests -q --cov=src --cov=api   # 173 testes, offline
+python -m ruff check .                           # precisa zerar
+python -m compileall -q src api.py main.py
+docker build -t affiore-chat:ci .               # valida o Dockerfile
+```
 
-## 📌 Contexto Atual — Projeto Final Módulo 2
+## Arquitetura
+
+```
+api.py                      FastAPI: valida, gerencia sessão, invoca o grafo
+ └─ src/graph.py            Grafo LangGraph (1 nó) + wrapper de observabilidade
+     └─ src/nodes/code_analyzer.py   Prompt da Affiore + formatação de estado
+         ├─ src/tools/llm_tool.py     Provedores, fallback, tool-calling
+         │   └─ src/tools/affiore_tool.py   Links, preços e tools do catálogo
+         └─ src/tools/observability.py     JSONL + auditoria por execução
+main.py                     CLI para depurar sem subir a API
+chat.html                   Interface web de demonstração
+tests/                      Suíte offline (unitário, integração e concorrência)
+```
+
+## Estado compartilhado (`src/state.py`)
+
+`ChatState` é `TypedDict(total=False)` — todas as chaves opcionais porque o
+LangGraph exige. O grafo é linear e **não usa reducers**, então cada nó devolve o
+dicionário completo com `{**state, ...}`. Sem reducer, devolver só a chave nova
+apagaria o resto do estado.
+
+## Observabilidade
+
+Cada execução recebe seu próprio `RunObserver`, guardado num `ContextVar` via
+`run_scope()`. Isso é obrigatório: com um singleton de processo, requisições
+HTTP simultâneas sobrescrevem o `run_id` uma da outra e misturam os eventos de
+clientes diferentes no mesmo arquivo. Dois artefatos por execução, correlacionados
+pelo `run_id`: `logs/run_<id>.jsonl` e `logs/audit_<id>.json`.
+
+## Memória de sessão
+
+`SessionStore` guarda as conversas em memória: TTL real com remoção na escrita,
+teto de sessões e de mensagens. O ciclo de vida de uma conversa roda sob
+`with sessoes.travar(session_id):` — atender uma mensagem é read-modify-write do
+histórico e, sem serialização, duas requisições simultâneas na mesma conversa se
+sobrescrevem. Sessões diferentes continuam em paralelo.
+
+## Contexto do repositório
 
 | Item | Valor |
 |------|-------|
-| **Repositório** | https://github.com/RSC-SC/IADev-ProjFinal-Mod2 |
-| **Fase** | Evolução do Mini-Projeto (entregue 20/07/26) → Projeto Final |
-| **Prazo** | 31/08/2026 às 15h (submissão no AVA) |
-| **Peso** | 60% da nota do módulo |
-| **Fluxo Git** | `main` ← `develop` ← `feature/*` |
+| Repositório | https://github.com/RSC-SC/agenteaffiore |
+| Stack | LangGraph, FastAPI, LangChain, Pytest, Ruff, Docker |
+| Python | 3.10+ (CI e imagem em 3.11) |
+| Fluxo Git | `main` ← `develop` ← `feature/*` |
 
-> O plano detalhado de trabalho (8 fases), a análise de gaps contra a rubrica e o log de decisões estão no documento externo `PLANO_PROJETO_FINAL_MOD2.md` (fora do repositório).
+### Histórico relevante
 
-### ✅ Baseline (Mini-Projeto concluído)
-- Agente LangGraph funcional: valida URL → lista PRs abertos → analisa diff com LLM → posta review no PR
-- Fallback LLM: Gemini 2.0 Flash → OpenRouter (`nemotron-3-super-120b-a12b:free`)
-- Memória: histórico de revisões em JSON (`reviews/`) injetado no prompt
-- README completo (escopo mini), prompts documentados, apresentação em `docs/`
-
-### 📂 Estrutura do Projeto
-```
-IADev-ProjFinal-Mod2/
-├── .env.example              # GITHUB_TOKEN, GOOGLE_API_KEY, OPENROUTER_API_KEY, OPENROUTER_MODEL
-├── .gitignore                # Ignora .env e enunciados (.md/.pdf)
-├── requirements.txt          # langgraph, langchain-google-genai, langchain-openai, PyGithub, python-dotenv
-├── AGENTS.md                 # Este arquivo (instruções do fluxo)
-├── main.py                   # CLI: python main.py <url-do-repo>
-├── reviews/                  # Histórico de revisões (JSON, gerado automaticamente)
-├── docs/
-│   ├── prompts.md            # Registro dos prompts utilizados
-│   └── Agente Revisor de PRs.pptx/pdf  # Apresentação (2 slides)
-└── src/
-    ├── state.py              # PRReviewState (TypedDict)
-    ├── graph.py              # Grafo LangGraph com validação + loop
-    ├── nodes/
-    │   ├── validation.py     # Valida URL e pelo menos uma chave LLM
-    │   ├── pr_collector.py   # Busca PRs abertos + coleta diff
-    │   ├── history_loader.py # Carrega histórico de revisões
-    │   ├── code_analyzer.py  # Análise com fallback Gemini → OpenRouter
-    │   ├── comment_poster.py # Posta review no PR + salva no histórico
-    │   └── finish.py         # Encerra execução
-    └── tools/
-        ├── github_tool.py    # Wrapper PyGithub (Auth.Token)
-        ├── sanitizer.py      # Defesa anti prompt-injection (detecção/neutralização/envelope)
-        ├── observability.py  # Dois sinais correlacionados: JSONL estruturado + auditoria com latência
-        └── memory_tool.py    # Leitura/escrita do histórico JSON
-```
-
-### 🔧 Stack Técnica
-- **Framework:** LangGraph (StateGraph)
-- **LLM Primário:** Google Gemini (`GOOGLE_MODEL`, padrão `gemini-3.6-flash`, via `langchain-google-genai`)
-- **LLM Fallback:** OpenRouter — `nvidia/nemotron-3-super-120b-a12b:free` (via `langchain-openai`)
-- **API GitHub:** PyGithub 2.9+ (`Auth.Token`)
-- **Python:** 3.10+
-
-### 📋 Roadmap do Projeto Final (resumo — detalhes no plano externo)
-
-| Fase | Escopo | Status |
-|------|--------|--------|
-| F0 | Preparação: branches main/develop, AGENTS.md, prompts.md, Kanban | ✅ Concluída (20/08/26) |
-| F1 | Paralelização no grafo + robustez GitHubTool + 2 cenários documentados | ✅ Concluída (21/08/26) |
-| F2 | Sanitização anti prompt-injection + limites de autonomia (--dry-run) | ✅ |
-| F3 | Logs estruturados JSON + auditoria com latência (2 sinais correlacionados) | ✅ |
-| F4 | Testes pytest gerados/refinados com IA + review do próprio agente em PR real | ✅ Suíte 102 testes em /tests (docs/qa/) |
-| F5 | Pipeline CI (lint/testes/build) + análise de logs por IA + anomalia + risco | ✅ CI verde no PR #19 (evidência em docs/evidencias/fase5_devops.md) |
-| F6 | Automação low-code n8n integrada (trigger + saída observável) | ✅ PR #21 (evidência em docs/evidencias/fase6_n8n.md) |
-| F7 | README final, refinamentos documentados, merge main, vídeo, submissão AVA | ⬜ |
-
-### 🌿 Branches
-| Branch | Papel |
-|--------|-------|
-| `main` | Produção — versão final avaliada |
-| `develop` | Integração — base das feature branches |
+Este repositório nasceu como *Agente Revisor de PRs* e foi convertido para o
+*Agente de Chat Affiore* (Issue #1). Todo o código do revisor foi removido junto
+com os testes, o workflow n8n e a documentação correspondentes. Não reintroduza
+nós de revisão de PR — o escopo é exclusivamente o chat da Affiore.
