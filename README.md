@@ -135,19 +135,25 @@ Limpa a memória de uma sessão. Devolve `{"session_id": ..., "removed": true|fa
 
 ## Fallback de provedores
 
-O agente tenta **Gemini → Groq → OpenRouter** e avança quando o anterior falha
-por quota, 429 ou timeout. O fallback acontece **na invocação**, não apenas na
-construção do cliente: um provedor que responde com erro libera o próximo com a
-mesma conversa.
+O agente tenta **Gemini → Groq → OpenRouter** e avança quando o anterior falha.
+Críticas de credencial (`401`, `402`, `403`) são tratadas como **falha
+permanente** daquele provedor neste processo: ele é desativado da rotação
+imediatamente para evitar repetir uma chamada que nunca vai dar certo. Erros
+transitórios (`408`, `429`, `5xx` ou timeout) não disparam o circuit breaker e o
+provedor continua elegível para a próxima mensagem.
+
+O fallback acontece **na invocação**, não apenas na construção do cliente: um
+provedor que responde com erro libera o próximo com a mesma conversa.
 
 `LLM_PRIMARY_PROVIDER` inverte a ordem sem desligar o fallback. Cada provedor
 declara se suporta tool-calling — os modelos `:free` do OpenRouter não a suportam
 de forma confiável, então são chamados **sem** tools e recebem os links e preços
 do catálogo pelo prompt.
 
-Os provedores usados, as tentativas que falharam e a contagem de fallbacks ficam
-na auditoria de cada execução.
-
+Os provedores usados, as tentativas que falharam, o motivo (classificado) e a
+contagem de fallbacks ficam na auditoria de cada execução. O nível padrão do CLI
+é `WARNING` para não poluir a tela do cliente com a troca de provedor (que é
+rotina); suba com `CLI_LOG_LEVEL=DEBUG` ao diagnosticar localmente.
 ---
 
 ## Tool de catálogo

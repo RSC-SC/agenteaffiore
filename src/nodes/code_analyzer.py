@@ -13,7 +13,11 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.state import ChatState
-from src.tools.llm_tool import NenhumProvedorDisponivel, TodosProvedoresFalharam, chat
+from src.tools.llm_tool import (
+    NenhumProvedorDisponivel,
+    TodosProvedoresFalharam,
+    chat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +130,11 @@ def responder_chat(state: ChatState) -> dict[str, Any]:
 
     try:
         texto, provedor = chat(_para_mensagens_lc(historico))
-    except NenhumProvedorDisponivel:
-        logger.error("Nenhum provedor de LLM configurado (sessão %s).", session_id)
+    except NenhumProvedorDisponivel as exc:
+        # Cobre "nenhuma chave configurada" e "toda chave morta por credencial".
+        # A mensagem do cliente é a mesma; o técnico lê a exceção, que nomeia os
+        # provedores desativados quando é o caso.
+        logger.error("Sem provedor de LLM utilizável (sessão %s): %s", session_id, exc)
         return {
             **state,
             "response": "",

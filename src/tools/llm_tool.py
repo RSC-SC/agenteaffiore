@@ -12,6 +12,8 @@ o próximo da lista é tentado com a mesma conversa.
 """
 import logging
 import os
+import re
+import threading
 import time
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -62,9 +64,95 @@ PROVEDORES: dict[str, dict[str, Any]] = {
 # Ordem padrão de fallback quando LLM_PRIMARY_PROVIDER não é definido.
 ORDEM_PADRAO = ("gemini", "groq", "openrouter")
 
+# HTTP que significa "esta chave não volta a funcionar neste processo":
+# 401 (credencial inválida/revogada), 402 (sem crédito) e 403 (limite mensal
+# excedido — o caso observado com a chave do OpenRouter). Erro transitório é o
+# oposto disso: 429 (rate limit), 5xx e timeout merecem nova tentativa na
+# próxima mensagem.
+STATUS_PERMANENTE = frozenset({401, 402, 403})
+
+_RE_STATUS = re.compile(r"(?:error code|status code)[:\s]+(\d{3})", re.IGNORECASE)
+
+# Provedores cujas chaves falharam de forma permanente. O fallback é tentado a
+# cada mensagem, então repetir a chamada para uma chave morta custaria uma
+# ida à rede e uma falha por mensagem — sem chance de sucesso. Uma vez
+# desativado, o provedor sai da rotação até o processo reiniciar (reprobe).
+_desativados: set[str] = set()
+_trava_desativados = threading.Lock()
+
+
+def provedores_desativados() -> list[str]:
+    """Provedores fora da rotação por falha permanente de credencial."""
+    with _trava_desativados:
+        return sorted(_desativados)
+
+
+def resetar_provedores_desativados() -> None:
+    """Reabilita todos os provedores. Usado em teste e ao rodar a CLI."""
+    with _trava_desativados:
+        _desativados.clear()
+
+
+def _status_http(exc: Exception) -> int | None:
+    """Extrai o status HTTP da exceção, se houver.
+
+    Os SDKs da OpenAI e da LangChain expõem `status_code`; o corpo da resposta
+    também traz o número, então há um plano B textual para as exceções
+    reempacotadas que perdem o atributo.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    resposta = getattr(exc, "response", None)
+    status = getattr(resposta, "status_code", None)
+    if isinstance(status, int):
+        return status
+    achado = _RE_STATUS.search(str(exc))
+    return int(achado.group(1)) if achado else None
+
+
+def _motivo(exc: Exception) -> str:
+    """Classificação curta e legível da falha, para o log do operador."""
+    status = _status_http(exc)
+    if status in STATUS_PERMANENTE:
+        return f"HTTP {status} (credencial/permanente)"
+    if status is not None:
+        return f"HTTP {status}"
+    return type(exc).__name__
+
+
+def _eh_permanente(exc: Exception) -> bool:
+    return _status_http(exc) in STATUS_PERMANENTE
+
+
+def _desativar(provedor: str, exc: Exception) -> None:
+    """Tira o provedor da rotação após falha permanente de credencial."""
+    with _trava_desativados:
+        if provedor in _desativados:
+            return
+        _desativados.add(provedor)
+    logger.info(
+        "Provedor %s desativado neste processo (%s). Reative corrigindo a chave "
+        "e reiniciando. Detalhe completo: LOG_LEVEL=DEBUG (API) ou "
+        "CLI_LOG_LEVEL=DEBUG (CLI).",
+        provedor,
+        _motivo(exc),
+    )
+
 
 class NenhumProvedorDisponivel(RuntimeError):
-    """Nenhum provedor de LLM pôde ser construído a partir das variáveis de ambiente."""
+    """Nenhum provedor de LLM pôde ser usado.
+
+    Cobre os dois casos em que não sobrou modelo: nenhuma chave configurada, ou
+    todas as chaves configuradas falharam por credencial (401/402/403). Para o
+    cliente é a mesma situação — não há modelo utilizável agora — e ele recebe
+    a mesma mensagem amigável. A diferença fica para o técnico, que lê
+    `desativados` ou a mensagem.
+    """
+
+    def __init__(self, mensagem: str, desativados: Sequence[str] = ()) -> None:
+        self.desativados = list(desativados)
+        super().__init__(mensagem)
 
 
 class TodosProvedoresFalharam(RuntimeError):
@@ -140,8 +228,20 @@ def _suporta_tools(provedor: str) -> bool:
 
 
 def get_providers() -> list[tuple[str, Callable[[], BaseChatModel | None]]]:
-    """Devolve [(nome, fábrica)] na ordem de fallback configurada."""
-    return [(nome, lambda n=nome: _construir(n)) for nome in ordem_provedores()]
+    """Devolve [(nome, fábrica)] na ordem de fallback configurada.
+
+    Provedores desativados por falha permanente de credencial ficam de fora.
+    Devolve lista vazia se todos caíram — quem decide o erro é `chat()`, que
+    conhece também a lista de desativados e monta a mensagem.
+    """
+    with _trava_desativados:
+        fora = set(_desativados)
+    return [
+        (nome, lambda n=nome: _construir(n))
+        for nome in ordem_provedores()
+        if nome not in fora
+    ]
+
 
 
 def get_llm(tools: list[BaseTool] | None = None) -> BaseChatModel:
@@ -282,8 +382,29 @@ def chat(
             observador.llm_attempt(
                 nome, ok=False, duration_ms=(time.perf_counter() - inicio) * 1000, error=str(exc)
             )
-            logger.warning("Provedor %s falhou; tentando o próximo.", nome, exc_info=True)
+            # O fallback é rotina, não incidente: uma linha curta em INFO (oculta
+            # no nível padrão) e o detalhe técnico apenas no audit JSONL. O
+            # traceback vai para o console só em LOG_LEVEL=DEBUG — no CLI quem
+            # lê a tela é o cliente, e ele não deve ver URL de endpoint nem
+            # identificador de chave.
+            logger.info(
+                "Provedor %s falhou (%s); tentando o próximo.",
+                nome,
+                _motivo(exc),
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            if _eh_permanente(exc):
+                _desativar(nome, exc)
 
+    desativados = provedores_desativados()
+    if algum_configurado and tentativas and all(n in desativados for n in tentativas):
+        # Toda chave configurada morreu por credencial. Repetir não adianta: o
+        # operador precisa corrigir a chave e reiniciar o processo.
+        raise NenhumProvedorDisponivel(
+            "Todas as chaves de LLM configuradas falharam por credencial/permissão: "
+            f"{', '.join(desativados)}. Reative corrigindo a chave e reiniciando.",
+            desativados=desativados,
+        )
     if not algum_configurado:
         raise NenhumProvedorDisponivel(
             "Configure ao menos uma chave: "

@@ -15,10 +15,33 @@ os.environ.setdefault("OPENROUTER_API_KEY", "")
 
 @pytest.fixture(autouse=True)
 def _sem_flags_de_contingencia(monkeypatch):
-    """Garante que DISABLE_LLM/LLM_DISABLE_TOOLS não vazem entre testes."""
+    """Garante que DISABLE_LLM/LLM_DISABLE_TOOLS não vazem entre testes.
+
+    Também limpa `LLM_PRIMARY_PROVIDER` e `CLI_LOG_LEVEL`: importar `api` chama
+    `load_dotenv()`, que injeta o `.env` local do desenvolvedor no `os.environ`
+    do processo e faria a ordem de fallback — e o nível de log — depender da
+    máquina. A suíte precisa ser determinística em qualquer ambiente.
+    """
     monkeypatch.delenv("DISABLE_LLM", raising=False)
     monkeypatch.delenv("STATIC_RESPONSE_MESSAGE", raising=False)
     monkeypatch.delenv("LLM_DISABLE_TOOLS", raising=False)
+    monkeypatch.delenv("LLM_PRIMARY_PROVIDER", raising=False)
+    monkeypatch.delenv("CLI_LOG_LEVEL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _limpa_provedores_desativados():
+    """Zera o circuit breaker de credencial.
+
+    `_desativados` é estado de módulo: um teste que simula chave morta deixaria
+    o provedor fora da rotação dos testes seguintes, e a ordem de execução
+    passaria a importar para o resultado da suíte.
+    """
+    from src.tools import llm_tool
+
+    llm_tool.resetar_provedores_desativados()
+    yield
+    llm_tool.resetar_provedores_desativados()
 
 
 @pytest.fixture(autouse=True)

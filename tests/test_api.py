@@ -20,6 +20,30 @@ class TestHealth:
         with TestClient(api_limpa.app) as c:
             assert c.get("/health").status_code == 200
 
+    def test_saudavel_quando_nenhum_provedor_esta_desativado(self, cliente):
+        corpo = cliente.get("/health").json()
+        assert corpo["status"] == "ok"
+        assert corpo["provedores"]["desativados"] == []
+
+    def test_degradado_quando_uma_chave_de_llm_morre(self, cliente):
+        """O operador precisa ver a chave morta; o cliente do chat, não."""
+        from src.tools import llm_tool
+
+        llm_tool._desativar("openrouter", RuntimeError("Error code: 403"))
+        corpo = cliente.get("/health").json()
+        assert corpo["status"] == "degraded"
+        assert corpo["provedores"]["desativados"] == ["openrouter"]
+        assert "corrigir a chave" in corpo["provedores"]["como_recuperar"]
+
+    def test_diagnostico_de_provedor_nao_vaza_para_o_chat(self, grafo_conversando, cliente):
+        """A degradação é infraestrutura: não entra no corpo de /chat."""
+        from src.tools import llm_tool
+
+        llm_tool._desativar("openrouter", RuntimeError("Error code: 403"))
+        corpo = cliente.post("/chat", json={"message": "olá"}).json()
+        assert "openrouter" not in str(corpo)
+        assert "403" not in str(corpo)
+
 
 class TestValidacaoDeEntrada:
     def test_recusa_mensagem_vazia(self, cliente, grafo_conversando):

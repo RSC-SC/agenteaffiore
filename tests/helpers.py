@@ -57,3 +57,16 @@ class ObjetoComStr:
 
     def __str__(self):
         return "bruto"
+
+
+class ErroHttp(Exception):
+    """Erro de API com status HTTP, como os SDKs da OpenAI e do Gemini levantam.
+
+    Reproduz o caso real visto com a chave do OpenRouter: 403 por limite mensal
+    excedido, que é o que o agente deve classificar como falha permanente de
+    credencial (e não como algo que se resolve tentando de novo).
+    """
+
+    def __init__(self, status_code, mensagem="falha simulada"):
+        super().__init__(f"Error code: {status_code} - {mensagem}")
+        self.status_code = status_code

@@ -1,7 +1,10 @@
 """Testes de `src/tools/llm_tool.py`: ordem de fallback, tool-calling e normalização."""
-import pytest
+import logging
 
-from tests.helpers import FakeLLM, FakeResponse, FakeTool, ObjetoComStr
+import pytest
+from langchain_core.messages import HumanMessage
+
+from tests.helpers import ErroHttp, FakeLLM, FakeResponse, FakeTool, ObjetoComStr
 
 
 class TestOrdemDeProvedores:
@@ -304,3 +307,194 @@ class TestConstrucaoDeCliente:
 
         monkeypatch.setattr(builtins, "__import__", _import_falho)
         assert llm_tool._construir("groq") is None
+
+
+class TestClassificacaoDeFalha:
+    """Distingue credencial morta de falha que vale tentar de novo."""
+
+    def test_le_status_do_atributo(self):
+        from src.tools import llm_tool
+
+        assert llm_tool._status_http(ErroHttp(403)) == 403
+
+    def test_le_status_do_corpo_quando_o_atributo_se_perde(self):
+        """SDKs reempacotados perdem `status_code`; o corpo ainda traz o número."""
+        from src.tools import llm_tool
+
+        cru = RuntimeError(
+            "Error code: 401 - {'error': {'message': 'Key limit exceeded (monthly limit)'}}"
+        )
+        assert llm_tool._status_http(cru) == 401
+
+    def test_sem_status_devolve_none(self):
+        from src.tools import llm_tool
+
+        assert llm_tool._status_http(TimeoutError("esgotou o tempo")) is None
+
+    @pytest.mark.parametrize("status", [401, 402, 403])
+    def test_credencial_morta_e_permanente(self, status):
+        from src.tools import llm_tool
+
+        assert llm_tool._eh_permanente(ErroHttp(status)) is True
+
+    @pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
+    def test_rate_limit_e_erro_de_servidor_sao_transitorios(self, status):
+        from src.tools import llm_tool
+
+        assert llm_tool._eh_permanente(ErroHttp(status)) is False
+
+    def test_timeout_sem_status_e_transitorio(self):
+        from src.tools import llm_tool
+
+        assert llm_tool._eh_permanente(TimeoutError("esgotou o tempo")) is False
+
+    def test_motivo_nao_vaza_a_mensagem_inteira(self):
+        """O motivo vai para o log do operador: curto e sem detalhe da API."""
+        from src.tools import llm_tool
+
+        erro = ErroHttp(403, "Key limit exceeded (monthly limit). Manage it using "
+                    "https://openrouter.ai/workspaces/default/keys/53da61e7...")
+        motivo = llm_tool._motivo(erro)
+        assert "403" in motivo
+        assert "openrouter.ai" not in motivo
+        assert len(motivo) < 60
+
+
+class TestCircuitBreakerDeCredencial:
+    """Chave morta sai da rotação: repetir a chamada seria custo sem chance."""
+
+    def test_falha_permanente_desativa_o_provedor(self, fake_llm, monkeypatch):
+        from src.tools import llm_tool
+
+        # OpenRouter em primeiro, como na config que expôs a chave com limite
+        # mensal excedido: sem isso o groq responderia e ele nunca seria testado.
+        monkeypatch.setenv("LLM_PRIMARY_PROVIDER", "openrouter")
+        fake_llm(
+            {
+                "openrouter": FakeLLM([ErroHttp(403)], nome="or"),
+                "gemini": FakeLLM([ErroHttp(403)], nome="gem"),
+                "groq": FakeLLM(nome="groq-fake"),
+            }
+        )
+        texto, provedor = llm_tool.chat([])
+        assert (texto, provedor) == ("ok", "groq")
+        assert llm_tool.provedores_desativados() == ["gemini", "openrouter"]
+
+    def test_provedor_desativado_nao_e_tentado_de_novo(
+        self, fake_llm, monkeypatch
+    ):
+        """A segunda mensagem não pode pagar outra ida à rede numa chave morta."""
+        from src.tools import llm_tool
+
+        monkeypatch.setenv("LLM_PRIMARY_PROVIDER", "openrouter")
+        or_quebrado = FakeLLM([ErroHttp(403), ErroHttp(403)], nome="or")
+        fake_llm(
+            {
+                "openrouter": or_quebrado,
+                "gemini": FakeLLM([ErroHttp(403)], nome="gem"),
+                "groq": FakeLLM(nome="groq-fake"),
+            }
+        )
+        llm_tool.chat([])
+        assert len(or_quebrado.calls) == 1
+
+        llm_tool.chat([])
+        assert len(or_quebrado.calls) == 1, "chave morta não pode ser chamada de novo"
+
+    def test_falha_transitoria_mantem_o_provedor_na_rota(self, fake_llm):
+        """429 e 5xx podem se resolver: o provedor continua elegível."""
+        from src.tools import llm_tool
+
+        fake_llm(
+            {
+                "gemini": FakeLLM([ErroHttp(429)], nome="gem"),
+                "groq": FakeLLM(nome="groq-fake"),
+            }
+        )
+        llm_tool.chat([])
+        assert "gemini" not in llm_tool.provedores_desativados()
+        assert [n for n, _ in llm_tool.get_providers()][0] == "gemini"
+
+    def test_todas_as_chaves_mortas_levanta_sem_provedor_utilizavel(self, fake_llm):
+        from src.tools import llm_tool
+
+        fake_llm(
+            {
+                "gemini": FakeLLM([ErroHttp(401)], nome="gem"),
+                "groq": FakeLLM([ErroHttp(402)], nome="groq"),
+                "openrouter": FakeLLM([ErroHttp(403)], nome="or"),
+            }
+        )
+        with pytest.raises(llm_tool.NenhumProvedorDisponivel) as info:
+            llm_tool.chat([])
+        assert info.value.desativados == ["gemini", "groq", "openrouter"]
+
+    def test_nao_tenta_reiniciar_processo_sozinho(self, fake_llm):
+        """Com todas mortas, a 2ª chamada falha na hora, sem tocar a rede."""
+        from src.tools import llm_tool
+
+        for nome in ("gemini", "groq", "openrouter"):
+            fake_llm({nome: FakeLLM([ErroHttp(403)], nome=nome)})
+            with pytest.raises(llm_tool.NenhumProvedorDisponivel):
+                llm_tool.chat([])
+        assert llm_tool.provedores_desativados() == ["gemini", "groq", "openrouter"]
+
+    def test_reset_reabilita_os_provedores(self, fake_llm):
+        from src.tools import llm_tool
+
+        fake_llm(
+            {
+                "gemini": FakeLLM([ErroHttp(403)], nome="gem"),
+                "groq": FakeLLM([ErroHttp(403)], nome="groq"),
+                "openrouter": FakeLLM([ErroHttp(403)], nome="or"),
+            }
+        )
+        with pytest.raises(llm_tool.NenhumProvedorDisponivel):
+            llm_tool.chat([])
+        llm_tool.resetar_provedores_desativados()
+        assert llm_tool.provedores_desativados() == []
+
+
+class TestLogDoFallbackNaoVazaParaOTela:
+    """O console do CLI é lido pelo cliente: o fallback precisa ser silencioso."""
+
+    def test_falha_permanente_registra_motivo_curto_sem_traceback(self, fake_llm, caplog):
+        from src.tools import llm_tool
+
+        fake_llm(
+            {
+                "gemini": FakeLLM([ErroHttp(403)], nome="gem"),
+                "groq": FakeLLM(nome="groq-fake"),
+            }
+        )
+        with caplog.at_level(logging.INFO):
+            llm_tool.chat([])
+        registros = [r for r in caplog.records if "falhou" in r.getMessage()]
+        assert registros, "o fallback precisa continuar registrado no log"
+        assert not any(r.exc_info for r in registros)
+        assert "403" in registros[0].getMessage()
+
+    def test_traceback_so_aparece_em_debug(self, fake_llm, caplog):
+        """O técnico tem o detalhe completo; o cliente, não."""
+        from src.tools import llm_tool
+
+        fake_llm(
+            {
+                "gemini": FakeLLM([ErroHttp(403)], nome="gem"),
+                "groq": FakeLLM(nome="groq-fake"),
+            }
+        )
+        with caplog.at_level(logging.DEBUG):
+            llm_tool.chat([])
+        registros = [r for r in caplog.records if "falhou" in r.getMessage()]
+        assert all(r.exc_info for r in registros)
+
+    def test_o_log_nao_e_vazado_para_o_conteudo_do_modelo(self, fake_llm):
+        """A falha de um provedor não entra no histórico que vai ao LLM seguinte."""
+        from src.tools import llm_tool
+
+        groq = FakeLLM(nome="groq-fake")
+        fake_llm({"gemini": FakeLLM([ErroHttp(403)], nome="gem"), "groq": groq})
+        llm_tool.chat([HumanMessage("olá")])
+        enviado = groq.calls[0]
+        assert all("403" not in str(m.content) for m in enviado)

@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.graph import build_graph
+from src.tools.llm_tool import provedores_desativados
 from src.tools.observability import run_scope
 
 load_dotenv()
@@ -298,8 +299,23 @@ def secrets_compare(a: str, b: str) -> bool:
 
 @app.get("/health")
 def health_check() -> dict:
-    """Verificação de disponibilidade e diagnóstico de memória de sessão."""
-    return {"status": "ok", "service": "agente-chat-affiore", "sessoes": sessoes.stats()}
+    """Verificação de disponibilidade e diagnóstico de memória de sessão.
+
+    `provedores.desativados` é o único lugar onde o operador enxerga que uma
+    chave de LLM morreu e o agente está degradado para um provedor só. O
+    cliente do chat não recebe nada disso: aqui é diagnóstico de infraestrutura.
+    """
+    desativados = provedores_desativados()
+    return {
+        "status": "ok" if not desativados else "degraded",
+        "service": "agente-chat-affiore",
+        "sessoes": sessoes.stats(),
+        "provedores": {
+            "desativados": desativados,
+            "motivo": "credencial inválida, sem crédito ou limite excedido",
+            "como_recuperar": "corrigir a chave e reiniciar o processo",
+        },
+    }
 
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(exigir_autenticacao)])
@@ -307,7 +323,8 @@ def chat_endpoint(payload: ChatRequest, request: Request) -> ChatResponse:
     """Atende uma mensagem do usuário.
 
     Resposta de negócio com erro sai em HTTP 200 com ``error`` preenchido — é o
-    que o n8n espera. Falha inesperada sai em HTTP 500 sem vazar detalhe interno.
+    que o `chat.html` consome. Falha inesperada sai em HTTP 500 sem vazar
+    detalhe interno.
     """
     cliente = request.client.host if request.client else "desconhecido"
     if not rate_limiter.permitir(cliente):

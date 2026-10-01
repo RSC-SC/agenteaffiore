@@ -8,6 +8,7 @@ apenas da sessão do terminal.
 """
 import logging
 import os
+import sys
 
 from dotenv import load_dotenv
 
@@ -22,11 +23,39 @@ COMANDOS_SAIDA = {"sair", "exit", "quit", "sai"}
 SEPARADOR = "=" * 60
 
 
+def _configurar_saida() -> None:
+    """Força UTF-8 na saída padrão.
+
+    O console do Windows vem em cp1252 por padrão, e `print` de emoji ou acento
+    estoura `UnicodeEncodeError` — a CLI morre antes de falar com o cliente.
+    `errors="replace"` garante que um caractere exótico degrade em vez de
+    derrubar a conversa.
+    """
+    for fluxo in (sys.stdout, sys.stderr):
+        reconfigure = getattr(fluxo, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            logger.debug("Não foi possível reconfigurar %s para UTF-8.", fluxo, exc_info=True)
+
+
 def main() -> int:
     """Executa o loop conversacional. Devolve o código de saída do processo."""
+    _configurar_saida()
+    # O CLI tem audiência própria: quem lê a tela é o cliente da Affiore, e a
+    # troca de provedor é rotina, não incidente. Por isso o padrão é WARNING,
+    # separado do LOG_LEVEL da API (lá a tela é do técnico). Para diagnosticar:
+    #     CLI_LOG_LEVEL=DEBUG python main.py
+    nivel = (os.getenv("CLI_LOG_LEVEL") or "WARNING").upper()
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        level=getattr(logging, nivel, logging.WARNING),
         format="%(levelname)-8s %(message)s",
+        # `force=True` porque `basicConfig` é no-op se o root logger já tiver
+        # handler: sem isso, qualquer configuração de log anterior silenciaria
+        # o nível do CLI e a tela voltaria a exibir o fallback ao cliente.
+        force=True,
     )
     grafo = build_graph()
 
